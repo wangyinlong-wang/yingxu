@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: "0.6.11"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Enable pnpm
+        run: corepack enable
+      - name: Install media runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg fonts-dejavu-core
+      - name: Install backend dependencies
+        run: uv sync --project backend --locked
+      - name: Verify backend
+        run: |
+          uv run --project backend ruff check backend/app backend/tests scripts/control.py scripts/local_ai_setup.py scripts/local_ai_runtime.py
+          uv run --project backend pytest -q
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Verify frontend
+        working-directory: frontend
+        run: |
+          pnpm typecheck
+          pnpm test:unit -- --run
+          pnpm build
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify browser flows
+        working-directory: frontend
+        run: pnpm test:e2e

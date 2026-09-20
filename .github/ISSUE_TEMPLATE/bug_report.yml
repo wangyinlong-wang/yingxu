@@ -1,0 +1,35 @@
+name: 缺陷反馈
+description: 使用已脱敏的复现步骤报告问题。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        安全漏洞请使用仓库 Security 页的私密报告入口。
+        不要上传 .env、API Key、账号、设备序列号、私人媒体或完整运行数据库。
+  - type: input
+    id: revision
+    attributes:
+      label: 版本或提交
+      placeholder: "git rev-parse --short HEAD"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、Python/Node/FFmpeg 版本；涉及设备时填写 Android 与目标 App 版本，不填设备序列号。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤、预期与实际结果
+      description: 优先使用虚构素材和隔离测试，说明是否涉及真实模型或发布，但不要提供凭据。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 已脱敏的日志或截图
+      description: 只提供最小必要片段，删除认证信息、签名链接、账号和私人内容。

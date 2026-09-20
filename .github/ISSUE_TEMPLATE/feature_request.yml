@@ -1,0 +1,21 @@
+name: 功能建议
+description: 说明使用场景、当前限制和可验收的结果。
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与当前问题
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望行为与验收方式
+      description: 如涉及模型调用、平台操作或数据迁移，请说明相应边界。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方案
