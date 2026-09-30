@@ -169,7 +169,8 @@ def test_locked_device_without_saved_pin_keeps_manual_behavior(monkeypatch, tmp_
     assert not device.unlock_failure_latched("ABC123", config)
 
 
-def test_wireless_transport_uses_physical_serial_for_keychain_identity(monkeypatch, tmp_path):
+@pytest.mark.parametrize("transport", ["192.0.2.10:5555", "adb-ABC123-example._adb-tls-connect._tcp"])
+def test_wireless_transport_uses_physical_serial_for_keychain_identity(monkeypatch, tmp_path, transport):
     fake = _FakeDevice([])
     pin_reads = []
 
@@ -187,7 +188,7 @@ def test_wireless_transport_uses_physical_serial_for_keychain_identity(monkeypat
     monkeypatch.setattr(device, "_WAIT_AFTER_SYSTEM_KEY", 0)
     config = device.AppConfig(data_dir=tmp_path, _env_file=None)
 
-    assert device.ensure_unlocked("192.0.2.10:5555", fake, app_config=config) is False
+    assert device.ensure_unlocked(transport, fake, app_config=config) is False
     assert pin_reads == ["PHYSICAL123"]
     assert not device.unlock_failure_latched("PHYSICAL123", config)
 
@@ -465,7 +466,8 @@ def test_douyin_final_editor_fills_title_and_description_separately():
 
 
 @pytest.mark.parametrize("extra_media", [False, True])
-def test_douyin_album_selects_only_one_inventory_backed_video(monkeypatch, extra_media):
+@pytest.mark.parametrize("duration_id", ["gc9", "gc="])
+def test_douyin_album_selects_only_one_inventory_backed_video(monkeypatch, extra_media, duration_id):
     digest = "a" * 64
     folder = "lp_" + digest[:16]
     remote = f"/sdcard/Movies/LocalPublisher/{folder}/{folder}.mp4"
@@ -475,7 +477,7 @@ def test_douyin_album_selects_only_one_inventory_backed_video(monkeypatch, extra
         inventory += "\nRow: 1 _id=1536, _data=/unrelated.mp4, _size=9, mime_type=video/mp4"
     monkeypatch.setattr(device, "_adb", lambda *args, **kwargs: inventory)
     monkeypatch.setattr(device, "_WAIT_AFTER_NAVIGATION", 0)
-    grid = f'<hierarchy><node text="{folder}" /><node text="视频" /><node resource-id="com.ss.android.ugc.aweme:id/root_view" clickable="true"><node text="01:00" resource-id="com.ss.android.ugc.aweme:id/gc9" /></node></hierarchy>'
+    grid = f'<hierarchy><node text="{folder}" /><node text="视频" /><node resource-id="com.ss.android.ugc.aweme:id/root_view" clickable="true"><node text="01:00" resource-id="com.ss.android.ugc.aweme:id/{duration_id}" /></node></hierarchy>'
     fake = _FakeDevice(
         [
             _hierarchy("所有照片", "视频", clickable={"所有照片"}),
@@ -485,13 +487,77 @@ def test_douyin_album_selects_only_one_inventory_backed_video(monkeypatch, extra
         ]
     )
     nodes = device._hierarchy(fake)
-    item, _ = device._douyin_album_item(fake, nodes, "ABC123", remote, 9, digest, lambda: False)
+    item, _ = device._album_video_item(fake, nodes, "ABC123", remote, 9, digest, lambda: False)
     if extra_media:
         assert item is None
         assert fake.actions == []
     else:
         assert item["resource_id"] == "com.ss.android.ugc.aweme:id/root_view"
         assert len(fake.actions) == 3
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_douyin_405_resumes_camera_only_with_current_account_evidence(monkeypatch, local_media, expired):
+    video, cover = local_media
+    digest = hashlib.sha256(video.read_bytes()).hexdigest()
+    remote = device._expected_remote_video_path(digest)
+    fake = _FakeDevice([
+        _hierarchy("相册", "拍摄，按钮", clickable={"相册"}),
+        _hierarchy("所有照片", "视频"),
+    ])
+    _prepare_monkeypatch(monkeypatch, fake)
+    monkeypatch.setattr(device, "_package_version", lambda *_args: "40.5.0")
+    monkeypatch.setattr(device, "_transfer_media", lambda *_args: (remote, "/cover.png"))
+    album_calls = []
+
+    def select_album(phone, nodes, *args, **kwargs):
+        album_calls.append(args)
+        return None, nodes
+
+    monkeypatch.setattr(device, "_album_video_item", select_album)
+    previous = {
+        "serial": "ABC123", "platform": "douyin", "app_version": "40.5.0",
+        "verified_account_identifier": "expected-user", "video_sha256": digest,
+        "caption": "审核文案", "page": "camera", "remote_video_path": remote,
+        "verified_at": (datetime.now(UTC) - timedelta(minutes=31 if expired else 1)).isoformat(),
+    }
+    result = device.prepare_upload(
+        serial="ABC123", platform="douyin", account_identifier="expected-user",
+        video_path=str(video), cover_path=str(cover), caption="审核文案",
+        progress=lambda *_args: None, canceled=lambda: False, previous_evidence=previous,
+    )
+    assert result["status"] == "NEEDS_ATTENTION"
+    assert result["evidence"]["reason"] == (
+        "ACCOUNT_VERIFICATION_REQUIRED" if expired else "MEDIA_SELECTION_REQUIRED"
+    )
+    assert len(album_calls) == (0 if expired else 1)
+    assert len(fake.actions) == (0 if expired else 1)
+
+
+@pytest.mark.parametrize("extra_media,extra_tile", [(False, False), (True, False), (False, True)])
+def test_xhs_947_album_requires_matching_inventory_and_single_grid_tile(monkeypatch, extra_media, extra_tile):
+    digest = "b" * 64
+    folder = f"lp_{digest[:16]}"
+    remote = device._expected_remote_video_path(digest)
+    path = remote.replace("/sdcard", "/storage/emulated/0")
+    inventory = f"Row: 0 _id=1535, _data={path}, _size=9, mime_type=video/mp4"
+    if extra_media:
+        inventory += "\nRow: 1 _id=1536, _data=/other.mp4, _size=9, mime_type=video/mp4"
+    monkeypatch.setattr(device, "_adb", lambda *_args, **_kwargs: inventory)
+    monkeypatch.setattr(device, "_WAIT_AFTER_NAVIGATION", 0)
+    tile = '<node package="com.xingin.xhs" class="android.widget.ImageView" clickable="true" />'
+    grid = (f'<hierarchy><node text="{folder}" /><node text="视频" /><node text="照片" />'
+            '<node package="com.xingin.xhs" class="android.widget.ImageView" content-desc="关闭" clickable="true" />'
+            '<node text="0:33" package="com.xingin.xhs" class="android.widget.TextView" />'
+            + tile * (2 if extra_tile else 1) + '</hierarchy>')
+    # Resource ids are present on the real nodes even when their labels are empty.
+    grid = grid.replace('package="com.xingin.xhs"', 'resource-id="obfuscated" package="com.xingin.xhs"')
+    fake = _FakeDevice([_hierarchy(folder, "视频", "照片", clickable={"视频"}), grid],
+                       packages=["com.xingin.xhs"] * 2)
+    item, _ = device._album_video_item(fake, device._hierarchy(fake), "ABC123", remote,
+                                      9, digest, lambda: False, platform="xiaohongshu")
+    assert (item is not None) is (not extra_media and not extra_tile)
+    assert len(fake.actions) == (0 if extra_media else 1)
 
 
 def test_transfer_rejects_changed_video_and_preserves_png_extension(monkeypatch, tmp_path):
@@ -510,6 +576,37 @@ def test_transfer_rejects_changed_video_and_preserves_png_extension(monkeypatch,
         device._transfer_media("ABC123", video, cover, "a" * 64)
     assert error.value.code == "MEDIA_TRANSFER_MISMATCH"
     assert any(call[-1].endswith(".png") for call in calls)
+
+
+@pytest.mark.parametrize("valid_evidence", [True, False])
+def test_xhs_chapter_tip_resume_retains_selection_and_never_reuploads(monkeypatch, local_media, valid_evidence):
+    video, cover = local_media
+    digest = hashlib.sha256(video.read_bytes()).hexdigest()
+    fake = _FakeDevice([
+        _hierarchy("添加章节，在视频上划重点！", "我知道了", clickable={"我知道了"}),
+        _hierarchy("下一步", clickable={"下一步"}),
+        _hierarchy("填写正文", "发布笔记", "审核文案"),
+    ], packages=["com.xingin.xhs"] * 3)
+    _prepare_monkeypatch(monkeypatch, fake)
+    monkeypatch.setattr(device, "_package_version", lambda *_args: "9.47.0")
+    monkeypatch.setattr(device, "_transfer_media", lambda *_args: pytest.fail("must retain selection"))
+    previous = {
+        "serial": "ABC123", "platform": "xiaohongshu", "app_version": "9.47.0",
+        "verified_account_identifier": "expected-user", "video_sha256": digest,
+        "caption": "审核文案" if valid_evidence else "另一条文案", "page": "unknown",
+        "verified_at": datetime.now(UTC).isoformat(), "reason": "UNKNOWN_PAGE",
+        "detail": "素材选择后的下一步控件无法唯一识别",
+    }
+    result = device.prepare_upload(
+        serial="ABC123", platform="xiaohongshu", account_identifier="expected-user",
+        video_path=str(video), cover_path=str(cover), caption="审核文案",
+        progress=lambda *_args: None, canceled=lambda: False, previous_evidence=previous,
+    )
+    assert result["status"] == ("WAITING_USER" if valid_evidence else "NEEDS_ATTENTION")
+    assert len(fake.actions) == (2 if valid_evidence else 0)
+    if valid_evidence:
+        assert result["evidence"]["selected_video_sha256"] == digest
+        assert result["evidence"]["final_publish_clicked"] is False
 
 
 def test_uiautomator_missing_or_mismatch_requires_explicit_setup(monkeypatch, tmp_path):

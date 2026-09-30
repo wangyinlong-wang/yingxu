@@ -34,6 +34,7 @@ from .models import (
 from .presets import preset_by_id
 from .providers import invoke_model, invoke_tikhub_source
 from .schemas import (
+    PAID_SOURCE_KINDS,
     MotionInput,
     MotionPlan,
     ProductionBrief,
@@ -47,6 +48,7 @@ from .services import (
     acquire_write,
     assert_models,
     asset_path,
+    checked_scene_audio,
     day_bounds,
     device_lock,
     digest,
@@ -59,8 +61,17 @@ from .services import (
     require,
     row,
     save_revision,
+    usage_summary,
 )
 from .storage import register_file
+from .topic_ranking import (
+    CLUSTER_WINDOW_HOURS,
+    MAX_RELATED,
+    heat_score,
+    same_event,
+    title_tokens,
+    versions_compatible,
+)
 
 
 class TaskContext:
@@ -208,6 +219,46 @@ def _usable_cached_asset(ctx: TaskContext, asset: Asset | None) -> Asset | None:
     return asset
 
 
+def _fullscreen_portrait_image(ctx: TaskContext, profile: dict) -> str:
+    """Copy the frozen global portrait into this content's usable image assets."""
+
+    portrait, portrait_path = _frozen_asset(ctx, profile.get("portrait"), {"portrait"})
+    input_hash = digest(
+        {
+            "fullscreen_avatar_portrait_version": 1,
+            "content_id": ctx.content_id,
+            "portrait_sha256": portrait.sha256,
+        }
+    )
+    with Session(ctx.engine) as session:
+        cached = _usable_cached_asset(
+            ctx,
+            session.scalar(
+                select(Asset).where(
+                    Asset.content_id == ctx.content_id,
+                    Asset.kind == "image",
+                    Asset.input_hash == input_hash,
+                )
+            ),
+        )
+        if cached:
+            return cached.id
+        acquire_write(session)
+        content = ctx.content(session)
+        copied = register_file(
+            session,
+            ctx.config,
+            portrait_path,
+            kind="image",
+            content_id=content.id,
+            mime_type=portrait.mime_type,
+            filename=f"本人数字人形象{portrait_path.suffix}",
+            input_hash=input_hash,
+        )
+        session.commit()
+        return copied.id
+
+
 def _local_scene_speech(
     ctx: TaskContext,
     *,
@@ -336,8 +387,60 @@ def normalize_source_url(url: str) -> str:
     )
 
 
+SOURCE_KINDS = {"rss", "hackernews", "x", "x_tikhub", "x_tikhub_search", "html_list"}
+# Paid reads whose charge state is unknown must stop the batch for manual reconciliation.
+UNRESOLVED_PAID_CODES = {"MODEL_OUTCOME_UNKNOWN", "MODEL_RESULT_ABANDONED", "JOB_INPUT_CHANGED", "TASK_CANCELED"}
+PIPELINE_TOPIC_DAYS = 2
+BACKOFF_BASE_MINUTES = 15
+BACKOFF_MAX_MINUTES = 24 * 60
+
+
+def source_backoff_until(failures: int, instant: datetime | None = None) -> str:
+    minutes = min(BACKOFF_MAX_MINUTES, BACKOFF_BASE_MINUTES * 2 ** max(0, failures - 1))
+    return ((instant or datetime.now(UTC)) + timedelta(minutes=minutes)).isoformat()
+
+
+def _merge_into_cluster(session: Session, topic_title: str, item: dict, source: Source) -> Topic | None:
+    tokens = title_tokens(topic_title)
+    if len(tokens) < 3:
+        return None
+    since = (datetime.now(UTC) - timedelta(hours=CLUSTER_WINDOW_HOURS)).isoformat()
+    # Only cross-source reports confirm an event; two posts from one source are two stories.
+    for candidate in session.scalars(
+        select(Topic)
+        .where(Topic.created_at >= since, Topic.source_id != source.id)
+        .order_by(Topic.created_at.desc())
+        .limit(300)
+    ):
+        if not same_event(tokens, title_tokens(candidate.title)) or not versions_compatible(
+            topic_title, candidate.title
+        ):
+            continue
+        related = list(candidate.related or [])
+        if any(entry.get("url") == item["url"] for entry in related):
+            return candidate
+        if len(related) < MAX_RELATED:
+            related.append(
+                {
+                    "source_id": source.id,
+                    "source_name": source.name,
+                    "title": topic_title[:300],
+                    "url": item["url"],
+                    "published_at": item.get("published_at"),
+                }
+            )
+        candidate.related = related
+        candidate.cluster_size = int(candidate.cluster_size or 1) + 1
+        candidate.score = max(candidate.score, float(item.get("score") or 0))
+        candidate.relevance_score = max(
+            candidate.relevance_score, max(0, min(100, float(item.get("relevance_score") or 0)))
+        )
+        return candidate
+    return None
+
+
 def collect(ctx: TaskContext, source_id: str, percent: int = 10) -> dict:
-    from .integrations.sources import collect_source, x_profile_handle
+    from .integrations.sources import collect_source, x_profile_handle, x_search_query
 
     with Session(ctx.engine) as session:
         source = require(session, Source, source_id)
@@ -351,13 +454,13 @@ def collect(ctx: TaskContext, source_id: str, percent: int = 10) -> dict:
             if (
                 not isinstance(snapshot, dict)
                 or snapshot.get("id") != source_id
-                or snapshot.get("kind") not in {"rss", "hackernews", "x", "x_tikhub"}
+                or snapshot.get("kind") not in SOURCE_KINDS
                 or not isinstance(snapshot.get("url"), str)
                 or not snapshot["url"]
             ):
                 raise AppError("JOB_INPUT_CHANGED", "采集任务的冻结来源输入无效，请重新提交", 409)
             source_data.update(kind=snapshot["kind"], url=snapshot["url"])
-        elif source.kind == "x_tikhub":
+        elif source.kind in PAID_SOURCE_KINDS:
             raise AppError(
                 "SOURCE_PROVIDER_CHANGED",
                 "旧采集任务未确认 TikHub 付费来源，请从来源页面重新发起采集",
@@ -365,20 +468,25 @@ def collect(ctx: TaskContext, source_id: str, percent: int = 10) -> dict:
             )
     try:
         with ctx.step(f"采集：{source_data['name']}", percent):
-            if source_data["kind"] == "x_tikhub":
+            if source_data["kind"] in PAID_SOURCE_KINDS:
+                target = (
+                    {"search": x_search_query(source_data["url"])}
+                    if source_data["kind"] == "x_tikhub_search"
+                    else {"screen_name": x_profile_handle(source_data["url"])}
+                )
                 paid = invoke_tikhub_source(
                     ctx.engine,
                     ctx.config,
                     job_id=ctx.job_id,
                     owner=ctx.owner,
                     source_id=source_id,
-                    screen_name=x_profile_handle(source_data["url"]),
+                    **target,
                 )
                 collection = collect_source(source_data, limit=30, tikhub_data=paid.get("data"))
             else:
                 collection = collect_source(source_data, limit=30)
             fetched = collection["items"]
-            count = 0
+            count = merged = 0
             with Session(ctx.engine) as session:
                 acquire_write(session)
                 ctx.guard(session)
@@ -398,6 +506,10 @@ def collect(ctx: TaskContext, source_id: str, percent: int = 10) -> dict:
                     )
                     if existing:
                         existing.score = max(existing.score, float(item.get("score") or 0))
+                        continue
+                    # The same event reported by another source strengthens one topic instead of duplicating it.
+                    if _merge_into_cluster(session, title, {**item, "url": url}, source):
+                        merged += 1
                         continue
                     published_at = item.get("published_at")
                     if published_at:
@@ -421,10 +533,12 @@ def collect(ctx: TaskContext, source_id: str, percent: int = 10) -> dict:
                     session.flush()
                     count += 1
                 source.last_collected_at, source.last_error = now(), collection.get("warning") or None
+                source.last_success_at, source.consecutive_failures, source.next_eligible_at = now(), 0, None
                 session.commit()
             return {
                 "collected": len(fetched),
                 "added": count,
+                "merged": merged,
                 "source_id": source_id,
                 "complete": collection["complete"],
                 "scanned": collection["scanned"],
@@ -437,8 +551,63 @@ def collect(ctx: TaskContext, source_id: str, percent: int = 10) -> dict:
             if job and job.status == "RUNNING" and job.lease_owner == ctx.owner and not job.cancel_requested:
                 source = require(session, Source, source_id)
                 source.last_error = getattr(error, "message", "采集未完成，请查看对应任务记录")[:1000]
+                source.consecutive_failures = int(source.consecutive_failures or 0) + 1
+                source.next_eligible_at = source_backoff_until(source.consecutive_failures)
                 session.commit()
         raise
+
+
+def collect_enabled_sources(
+    ctx: TaskContext, *, include_paid: bool = True, respect_backoff: bool = False, span: int = 60
+) -> list[dict]:
+    """Freeze enabled source inputs once, then collect each; one definitive failure never stops the rest."""
+    with Session(ctx.engine) as session:
+        acquire_write(session)
+        job = ctx.guard(session)
+        sources = list(session.scalars(select(Source).where(Source.enabled.is_(True))))
+        source_inputs = copy.deepcopy(job.payload.get("source_inputs", {}))
+        skipped: list[dict] = []
+        instant = now()
+        for source in sources:
+            if source.id in source_inputs:
+                continue
+            if not include_paid and source.kind in PAID_SOURCE_KINDS:
+                skipped.append({"source_id": source.id, "skipped": "PAID_NOT_INCLUDED"})
+                continue
+            if respect_backoff and source.next_eligible_at and source.next_eligible_at > instant:
+                skipped.append({"source_id": source.id, "skipped": "BACKOFF", "until": source.next_eligible_at})
+                continue
+            source_inputs[source.id] = {"id": source.id, "kind": source.kind, "url": source.url}
+        job.payload = {**job.payload, "source_inputs": source_inputs}
+        session.commit()
+        ctx.payload = copy.deepcopy(job.payload)
+        source_ids = [source.id for source in sources if source.id in source_inputs]
+    collected: list[dict] = list(skipped)
+    for index, source_id in enumerate(source_ids):
+        try:
+            collected.append(collect(ctx, source_id, int(index / max(1, len(source_ids)) * span)))
+        except Exception as error:
+            if ctx.canceled():
+                raise
+            code = getattr(error, "code", "SOURCE_FAILED")
+            paid = ctx.payload.get("source_inputs", {}).get(source_id, {}).get("kind") in PAID_SOURCE_KINDS
+            if paid and code in UNRESOLVED_PAID_CODES:
+                raise
+            collected.append({"source_id": source_id, "error_code": code})
+    return collected
+
+
+def collect_batch(ctx: TaskContext) -> dict:
+    collected = collect_enabled_sources(
+        ctx, include_paid=bool(ctx.payload.get("include_paid")), respect_backoff=True, span=95
+    )
+    added = sum(int(item.get("added") or 0) for item in collected)
+    failed = sum(1 for item in collected if item.get("error_code"))
+    return {
+        "sources": collected,
+        "added": added,
+        "message": f"本轮采集新增 {added} 条选题" + (f"，{failed} 个来源失败" if failed else ""),
+    }
 
 
 def generate_brief(ctx: TaskContext) -> None:
@@ -939,6 +1108,13 @@ def generate_assets(ctx: TaskContext) -> None:
     if not scenes:
         raise AppError("SCRIPT_REQUIRED", "请先生成分镜", 409)
     image_only = ctx.payload.get("stage") == "images"
+    fullscreen_avatar = (
+        ctx.payload.get("stage") == "local_avatar_all"
+        and ctx.payload.get("avatar_layout") == "fullscreen"
+    )
+    fullscreen_image_id = (
+        _fullscreen_portrait_image(ctx, local_profile) if fullscreen_avatar else None
+    )
     image_targets = set(ctx.payload.get("image_scene_ids", [])) if image_only else None
     if image_only and (
         not image_targets or not image_targets.issubset({scene.get("id") for scene in scenes})
@@ -949,7 +1125,16 @@ def generate_assets(ctx: TaskContext) -> None:
             continue
         percent = 20 + int(index / len(scenes) * 50)
         with ctx.step(f"镜头 {index + 1} 图片", percent):
-            if scene.get("image_asset_id"):
+            if fullscreen_avatar and scene.get("scene_type", "image") == "image":
+                scene["image_asset_id"] = fullscreen_image_id
+                with Session(ctx.engine) as session:
+                    acquire_write(session)
+                    content = ctx.content(session)
+                    updated = copy.deepcopy(content.scenes)
+                    updated[index]["image_asset_id"] = fullscreen_image_id
+                    content.scenes = updated
+                    session.commit()
+            elif scene.get("scene_type", "image") == "image" and scene.get("image_asset_id"):
                 with Session(ctx.engine) as session:
                     asset_path(ctx.config, require(session, Asset, scene["image_asset_id"]))
             elif scene.get("scene_type", "image") == "image":
@@ -990,7 +1175,7 @@ def generate_assets(ctx: TaskContext) -> None:
 
                 card_hash = digest(
                     {
-                        "card_renderer_version": 1,
+                        "card_renderer_version": 2,
                         "scene_type": scene.get("scene_type"),
                         "visual_data": scene.get("visual_data", {}),
                         "caption": scene.get("caption", ""),
@@ -1024,6 +1209,7 @@ def generate_assets(ctx: TaskContext) -> None:
                         height=video_settings["height"],
                         palette=preset["style"]["palette"],
                         font_path=video_settings.get("font_path", ""),
+                        caption=scene.get("caption", ""),
                     )
                     with Session(ctx.engine) as session:
                         acquire_write(session)
@@ -1049,6 +1235,9 @@ def generate_assets(ctx: TaskContext) -> None:
                     content.scenes = updated
                     session.commit()
         if image_only:
+            continue
+        if fullscreen_avatar and scene.get("scene_type", "image") == "image":
+            # H3 creates the full-screen avatar and its lip-synced native audio together.
             continue
         phrases = [scene["narration"].strip()] if scene["narration"].strip() else []
         if not phrases:
@@ -1095,6 +1284,102 @@ def generate_assets(ctx: TaskContext) -> None:
                     session.commit()
 
 
+def generate_video_clip(
+    ctx: TaskContext,
+    *,
+    scene_id: str | None = None,
+    step_name: str = "MiniMax H3 生成视频片段",
+    step_percent: int = 35,
+) -> str:
+    from .video_provider import invoke_video
+
+    target_scene_id = scene_id or ctx.payload["scene_id"]
+    with Session(ctx.engine) as session:
+        content = ctx.content(session)
+        scene = next(
+            (copy.deepcopy(item) for item in content.scenes if item["id"] == target_scene_id),
+            None,
+        )
+        if scene is None:
+            raise AppError("SCENE_NOT_FOUND", "分镜不存在", 404)
+        options = ctx.payload["video_options"]
+    width, height = options["width"], options["height"]
+    ratio = "9:16" if height > width else ("16:9" if width > height else "1:1")
+    # A short director brief keeps subject, action, shot and timing together. Generated
+    # footage is illustrative; exact facts, titles and narration remain authored locally.
+    prompt = (
+        f"画面：{scene['image_prompt']}\n镜头意图：{scene.get('shot_intent', '')}\n"
+        f"语义参考：{scene.get('narration', '')}\n"
+        "制作一个连续、自然运动的说明性镜头，不绘制字幕、数字、品牌标识或新闻截图。"
+        "保持主体一致，避免突然切镜。原声不用于成片，旁白与准确文字将在后期加入。"
+    )
+    references = ctx.payload.get("video_references", {})
+    if references:
+        prompt = (
+            f"画面与导演要求：{scene['image_prompt']}\n"
+            "Image 1 是经本人授权的形象参考，严格保持脸部身份、发型与眼镜等特征。"
+            + ("Audio 1 是本人声音参考，使用其音色用普通话朗读下述口播，嘴型与声音同步。" if references.get("audio") else "")
+            + f"\n口播全文：{scene.get('narration', '')}\n不要添加未给出的台词，不绘制字幕或标识。"
+        )
+    with ctx.step(step_name, step_percent):
+        result = invoke_video(
+            ctx.engine, ctx.config, job_id=ctx.job_id, owner=ctx.owner,
+            content_id=ctx.content_id, scope=f"content:{ctx.content_id}:scene:{scene['id']}:video",
+            payload={"prompt": prompt, "duration": options["clip_duration"],
+                     "resolution": options["clip_resolution"], "ratio": ratio, "references": references},
+        )
+        with Session(ctx.engine) as session:
+            acquire_write(session)
+            content = ctx.content(session)
+            updated = copy.deepcopy(content.scenes)
+            target = next(item for item in updated if item["id"] == scene["id"])
+            if target.get("audio_asset_ids") == [target.get("video_asset_id")]:
+                target["audio_asset_ids"] = []
+            target["video_asset_id"] = result["asset_id"]
+            content.scenes = updated
+            content.media_version = None
+            content.video_asset_id = content.cover_asset_id = content.subtitle_asset_id = None
+            session.commit()
+    return result["asset_id"]
+
+
+def generate_fullscreen_avatar_clips(ctx: TaskContext) -> None:
+    with Session(ctx.engine) as session:
+        content = ctx.content(session)
+        targets = [
+            copy.deepcopy(scene)
+            for scene in content.scenes
+            if scene.get("scene_type", "image") == "image"
+        ]
+        current = settings(session, ctx.config)
+        calls_today = usage_summary(session, current["timezone"])["calls_today"]
+        if not targets:
+            raise AppError(
+                "FULLSCREEN_AVATAR_SCENE_REQUIRED", "全屏数字人至少需要一个图片镜头", 409
+            )
+        if calls_today + len(targets) > current["limits"]["daily_calls"]:
+            raise AppError(
+                "DAILY_CALL_LIMIT", "剩余模型调用额度不足以完成全屏数字人生成", 409
+            )
+    for index, scene in enumerate(targets):
+        if ctx.canceled():
+            raise AppError("TASK_CANCELED", "任务已取消", 409)
+        asset_id = generate_video_clip(
+            ctx,
+            scene_id=scene["id"],
+            step_name=f"镜头 {index + 1} 全屏数字人",
+            step_percent=35 + int(index / len(targets) * 30),
+        )
+        with Session(ctx.engine) as session:
+            acquire_write(session)
+            content = ctx.content(session)
+            updated = copy.deepcopy(content.scenes)
+            target = next(item for item in updated if item["id"] == scene["id"])
+            target["audio_asset_ids"] = [asset_id]
+            content.scenes = updated
+            session.commit()
+
+
 def render(ctx: TaskContext) -> None:
     from .integrations.media import compose_video
 
@@ -1103,7 +1388,12 @@ def render(ctx: TaskContext) -> None:
         current = settings(session, ctx.config)
         render_settings = copy.deepcopy(current["video"])
         local_profile = copy.deepcopy(ctx.payload.get("local_ai") or {})
-        avatar_enabled = bool(local_profile.get("avatar_enabled"))
+        native_video_audio = any(
+            scene.get("video_asset_id")
+            and scene.get("audio_asset_ids") == [scene["video_asset_id"]]
+            for scene in content.scenes
+        )
+        avatar_enabled = bool(local_profile.get("avatar_enabled")) and not native_video_audio
         portrait = portrait_path = None
         if avatar_enabled:
             portrait, portrait_path = _frozen_asset(ctx, local_profile.get("portrait"), {"portrait"})
@@ -1122,7 +1412,7 @@ def render(ctx: TaskContext) -> None:
                 raise AppError("ASSETS_REQUIRED", "每个镜头需要图片和配音", 409)
             image = require(session, Asset, scene["image_asset_id"])
             image_path = asset_path(ctx.config, image)
-            audio_assets = [require(session, Asset, asset_id) for asset_id in scene["audio_asset_ids"]]
+            audio_assets = checked_scene_audio(session, ctx.config, content.id, scene)
             phrases = split_narration(scene["narration"])
             if len(audio_assets) == 1:
                 phrases = [scene["narration"]]
@@ -1136,10 +1426,13 @@ def render(ctx: TaskContext) -> None:
                 {"path": str(asset_path(ctx.config, audio)), "text": phrase}
                 for audio, phrase in zip(audio_assets, phrases)
             ]
+            clip = require(session, Asset, scene["video_asset_id"]) if scene.get("video_asset_id") else None
+            clip_path = asset_path(ctx.config, clip) if clip else None
             normalized = Scene.model_validate(scene)
             scenes.append(
                 {
                     "image_path": str(image_path),
+                    "video_path": str(clip_path) if clip_path else None,
                     "audio_segments": segments,
                     "caption": scene["caption"],
                     "highlight_terms": scene.get("highlight_terms", []),
@@ -1154,6 +1447,7 @@ def render(ctx: TaskContext) -> None:
             identities.append(
                 {
                     "image": image.sha256,
+                    "video": clip.sha256 if clip else None,
                     "audio": [audio.sha256 for audio in audio_assets],
                     "text": phrases,
                     "caption": scene["caption"],
@@ -1171,9 +1465,15 @@ def render(ctx: TaskContext) -> None:
                 render_settings[path_key] = str(
                     asset_path(ctx.config, require(session, Asset, render_settings[config_key]))
                 )
+        if render_settings.get("renderer") == "hypit":
+            from .integrations.hypit import hypit_version
+
+            render_settings["hypit_version"] = hypit_version(ctx.config.hypit_cli)
+            render_settings["hypit_cli"] = str(ctx.config.hypit_cli)
+            render_settings["hypit_runtime"] = str(ctx.config.data_dir / "hypit/runtime.json")
         render_hash = digest(
             {
-                "renderer_version": 8,
+                "renderer_version": 11,
                 "content_id": content.id,
                 "title": title,
                 "scenes": identities,
@@ -1204,6 +1504,23 @@ def render(ctx: TaskContext) -> None:
         if not use_cached:
             output_dir = ctx.config.data_dir / "runs" / ctx.job_id / "render"
             output_dir.mkdir(parents=True, exist_ok=True)
+            # Recreate cards from the current design even when an older card asset is still attached.
+            from .integrations.media import render_card
+
+            for index, scene in enumerate(scenes):
+                if scene["scene_type"] in {"text_card", "stat_card", "quote_card"}:
+                    card_path = output_dir / "cards" / f"scene-{index:03d}.png"
+                    render_card(
+                        scene_type=scene["scene_type"],
+                        visual_data=scene["visual_data"],
+                        destination=card_path,
+                        width=render_settings["width"],
+                        height=render_settings["height"],
+                        palette=preset["style"]["palette"],
+                        font_path=render_settings.get("font_path", ""),
+                        caption=scene["caption"],
+                    )
+                    scene["image_path"] = str(card_path)
             output = compose_video(
                 title=title,
                 scenes=scenes,
@@ -1431,7 +1748,7 @@ def transcribe_local_reference(ctx: TaskContext) -> dict:
         job = ctx.guard(session)
         if job.result.get("source_asset_id") and "transcript" in job.result:
             return copy.deepcopy(job.result)
-    source, source_path = _frozen_asset(ctx, ctx.payload.get("source"), {"voice_reference"})
+    source, source_path = _frozen_asset(ctx, ctx.payload.get("source"), {"voice_reference", "video_clip"})
     _assert_local_revision(ctx, ctx.payload.get("revision"), "transcribe")
     result = run_local(
         ctx.config,
@@ -1612,13 +1929,19 @@ def produce_content(ctx: TaskContext) -> dict:
         )
     if stage == "brief" and not completed_brief:
         generate_brief(ctx)
-    if (stage == "script" and not completed_script) or (stage == "all" and not has_script):
+    if (stage == "script" and not completed_script) or (
+        stage in {"all", "local_avatar_all"} and not has_script
+    ):
         plan_script(ctx)
-    if stage in {"all", "assets", "local_voice", "images"}:
+    if stage in {"all", "assets", "local_voice", "local_avatar_all", "images"}:
         generate_assets(ctx)
+    if stage == "local_avatar_all" and ctx.payload.get("avatar_layout") == "fullscreen":
+        generate_fullscreen_avatar_clips(ctx)
+    if stage == "video":
+        generate_video_clip(ctx)
     if stage == "motion" and not completed_motion:
         plan_motion(ctx)
-    if stage in {"all", "render", "local_voice", "motion", "images"}:
+    if stage in {"all", "render", "local_voice", "local_avatar_all", "motion", "images"}:
         render(ctx)
     with Session(ctx.engine) as session:
         acquire_write(session)
@@ -1660,6 +1983,7 @@ def prepare_device_publication(ctx: TaskContext) -> dict:
         if (
             current_account.account_identifier != account["account_identifier"]
             or current_account.device_serial != account["device_serial"]
+            or current_account.channel != account.get("channel", "android")
         ):
             raise AppError("ACCOUNT_CHANGED", "账号绑定发生变化，不能继续上传", 409)
         video = require(session, Asset, publication.snapshot["video_asset_id"])
@@ -1679,7 +2003,9 @@ def prepare_device_publication(ctx: TaskContext) -> dict:
         evidence = copy.deepcopy(publication.evidence)
         platform = publication.platform
         automatic = bool(publication.snapshot.get("auto_publish"))
+        browser_channel = account.get("channel", "android") == "browser"
         video_sha256 = video.sha256
+        cover_sha256 = cover.sha256
         description = "\n".join(
             value
             for value in (
@@ -1688,9 +2014,16 @@ def prepare_device_publication(ctx: TaskContext) -> dict:
             )
             if value
         )
+    if browser_channel:
+        from functools import partial
+
+        from .integrations import browser
+
+        prepare_upload = partial(browser.prepare_upload, app_config=ctx.config)
+        submit_publication = partial(browser.submit_publication, app_config=ctx.config)
     with device_lock(ctx.config):
         with ctx.step("核验账号并准备上传", 5):
-            if automatic:
+            if automatic and not browser_channel:
                 open_account_profile(
                     serial=account["device_serial"],
                     platform=platform,
@@ -1710,6 +2043,8 @@ def prepare_device_publication(ctx: TaskContext) -> dict:
                 previous_evidence=evidence or None,
                 title=text["title"],
                 description=description,
+                **({"expected_video_sha256": video_sha256, "expected_cover_sha256": cover_sha256}
+                   if browser_channel else {}),
             )
         if automatic and result.get("status") == "WAITING_USER":
             prepared_evidence = result.get("evidence", {})
@@ -1722,7 +2057,7 @@ def prepare_device_publication(ctx: TaskContext) -> dict:
                     if stage == "intent":
                         if not settings(session, ctx.config)["publishing"]["auto_publish_after_approval"]:
                             raise AppError(
-                                "AUTO_PUBLISH_DISABLED", "自动发布已关闭，成片保留在手机编辑页", 409
+                                "AUTO_PUBLISH_DISABLED", "自动发布已关闭，成片保留在当前编辑页", 409
                             )
                         if publication.evidence.get("submit_started_at") or publication.status != "PREPARING":
                             raise AppError("PUBLICATION_OUTCOME_UNKNOWN", "发布状态发生变化，未重复点击", 409)
@@ -1792,10 +2127,11 @@ def prepare_device_publication(ctx: TaskContext) -> dict:
             "status": publication.status,
             "message": (
                 {
-                    "WAITING_USER": "请在手机核验内容并最终发布，再回填作品链接",
+                    "WAITING_USER": "请在 Chrome 核验内容并最终发布，再识别作品链接" if browser_channel
+                    else "请在手机核验内容并最终发布，再回填作品链接",
                     "PUBLISHED": "已自动发布并核验作品链接",
                     "VERIFYING": "已提交发布，作品链接仍需核验；不会重复提交",
-                }.get(publication.status, "请查看设备现场并按提示接管")
+                }.get(publication.status, result.get("evidence", {}).get("detail") or "请查看设备现场并按提示接管")
             ),
         }
 
@@ -1812,6 +2148,7 @@ def read_metrics(ctx: TaskContext) -> dict:
         if publication.status != "PUBLISHED":
             raise AppError("PUBLISHED_WORK_REQUIRED", "没有已确认的作品可采集", 409)
         account = require(session, Account, publication.account_id)
+        browser_channel = account.channel == "browser"
         if session.scalar(select(Publication.id).where(Publication.reserved_serial == account.device_serial)):
             raise AppError("DEVICE_RESERVED", "该手机正在等待发布确认，数据采集已暂停", 409)
         data = {
@@ -1828,7 +2165,12 @@ def read_metrics(ctx: TaskContext) -> dict:
         }
         publication_id, reporting_title = publication.id, publication.content_title
     with device_lock(ctx.config), ctx.step("读取作品实际指标", 20):
-        values = collect_metrics(**data)
+        if browser_channel:
+            from .integrations.browser import collect_metrics as browser_metrics
+
+            values = browser_metrics(**data, app_config=ctx.config, canceled=ctx.canceled)
+        else:
+            values = collect_metrics(**data)
     with Session(ctx.engine) as session:
         acquire_write(session)
         job = ctx.guard(session)
@@ -1836,7 +2178,7 @@ def read_metrics(ctx: TaskContext) -> dict:
             publication_id=publication_id,
             platform=data["platform"],
             content_title=reporting_title,
-            source="device",
+            source="browser" if browser_channel else "device",
             raw=values.get("raw", {}),
             **{key: values.get(key) for key in ("views", "likes", "comments", "favorites", "shares")},
         )
@@ -1900,30 +2242,7 @@ def make_report(ctx: TaskContext) -> dict:
 
 
 def pipeline_batch(ctx: TaskContext) -> dict:
-    with Session(ctx.engine) as session:
-        acquire_write(session)
-        job = ctx.guard(session)
-        sources = list(session.scalars(select(Source).where(Source.enabled.is_(True))))
-        source_inputs = copy.deepcopy(job.payload.get("source_inputs", {}))
-        for source in sources:
-            source_inputs.setdefault(
-                source.id,
-                {"id": source.id, "kind": source.kind, "url": source.url},
-            )
-        job.payload = {**job.payload, "source_inputs": source_inputs}
-        session.commit()
-        ctx.payload = copy.deepcopy(job.payload)
-        source_ids = [source.id for source in sources]
-    collected = []
-    for index, source_id in enumerate(source_ids):
-        try:
-            collected.append(collect(ctx, source_id, int(index / max(1, len(source_ids)) * 60)))
-        except Exception as error:
-            if ctx.canceled():
-                raise
-            if ctx.payload.get("source_inputs", {}).get(source_id, {}).get("kind") == "x_tikhub":
-                raise
-            collected.append({"source_id": source_id, "error_code": getattr(error, "code", "SOURCE_FAILED")})
+    collected = collect_enabled_sources(ctx)
     with Session(ctx.engine) as session:
         acquire_write(session)
         ctx.guard(session)
@@ -1944,23 +2263,26 @@ def pipeline_batch(ctx: TaskContext) -> dict:
         available = max(
             0, min(ctx.payload["daily_limit"], current["limits"]["daily_videos"] - len(active_today))
         )
-        cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
-        topics = (
+        cutoff = (datetime.now(UTC) - timedelta(days=PIPELINE_TOPIC_DAYS)).isoformat()
+        candidates = (
             list(
                 session.scalars(
                     select(Topic)
                     .where(
                         Topic.status == "NEW",
                         Topic.relevance_score >= 40,
-                        (Topic.published_at.is_(None) | (Topic.published_at >= cutoff)),
+                        # Same rule as the recent-topics view: undated items cannot prove freshness.
+                        Topic.published_at >= cutoff,
                     )
                     .order_by(Topic.relevance_score.desc(), Topic.published_at.desc(), Topic.score.desc())
-                    .limit(available)
+                    .limit(500)
                 )
             )
             if available
             else []
         )
+        instant = datetime.now(UTC)
+        topics = sorted(candidates, key=lambda topic: heat_score(topic, instant), reverse=True)[:available]
         template = session.scalar(
             select(Template).where(Template.style == "brief").order_by(Template.created_at)
         )
@@ -2023,6 +2345,8 @@ def dispatch(ctx: TaskContext, kind: str) -> dict:
         return make_report(ctx)
     if kind == "PIPELINE_BATCH":
         return pipeline_batch(ctx)
+    if kind == "COLLECT_BATCH":
+        return collect_batch(ctx)
     if kind == "LOCAL_AI_TRANSCRIBE":
         return transcribe_local_reference(ctx)
     if kind == "LOCAL_AI_PREVIEW":

@@ -65,7 +65,8 @@ def test_final_click_is_fenced_once_and_missing_success_stays_unknown(monkeypatc
     assert result["status"] == ("PUBLISHED" if success else "VERIFYING")
 
 
-def test_xhs_946_final_click_uses_observed_send_note_label(monkeypatch):
+@pytest.mark.parametrize("version", ["9.46.0", "9.47.0"])
+def test_xhs_final_click_uses_observed_send_note_label(monkeypatch, version):
     editor = _hierarchy(
         "添加标题",
         "添加作品描述",
@@ -87,12 +88,14 @@ def test_xhs_946_final_click_uses_observed_send_note_label(monkeypatch):
         "确认并发布",
         clickable={"确认并发布"},
     )
+    if version == "9.47.0":
+        confirmed_declaration = '<hierarchy><node text="声明内容来源" /><node text="含 AI 合成内容" /><node content-desc="确认并发布" clickable="true"><node text="确认并发布" /></node></hierarchy>'
     fake = _FakeDevice(
         [editor, declaration, confirmed_declaration, _hierarchy("笔记发布成功", "测试标题")],
         packages=["com.xingin.xhs"] * 4,
     )
     _prepare_monkeypatch(monkeypatch, fake)
-    monkeypatch.setattr(device, "_package_version", lambda *_args: "9.46.0")
+    monkeypatch.setattr(device, "_package_version", lambda *_args: version)
     monkeypatch.setattr(
         publishing,
         "_copy_published_link",
@@ -105,7 +108,7 @@ def test_xhs_946_final_click_uses_observed_send_note_label(monkeypatch):
             "evidence": {
                 **arguments["evidence"],
                 "platform": "xiaohongshu",
-                "app_version": "9.46.0",
+                "app_version": version,
             },
         }
     )
@@ -117,7 +120,7 @@ def test_xhs_946_final_click_uses_observed_send_note_label(monkeypatch):
     assert fake.actions == [
         ("click", {"resourceId": "id/5"}),
         ("click", {"resourceId": "id/1"}),
-        ("click", {"resourceId": "id/2"}),
+        ("click", {"description": "确认并发布"} if version == "9.47.0" else {"resourceId": "id/2"}),
     ]
     assert result["status"] == "PUBLISHED"
     assert result["evidence"]["content_declaration"] == "ai_generated"
@@ -218,6 +221,26 @@ def test_final_click_stops_before_intent_when_caption_changed(monkeypatch):
         )
     assert error.value.code == "PUBLISH_EDITOR_CHANGED"
     assert fake.actions == []
+
+
+@pytest.mark.parametrize("card_description", [False, True])
+def test_detect_xhs_opens_exact_title_from_verified_profile(monkeypatch, config, card_description):
+    profile = _hierarchy("小红书号：expected-user", "编辑资料", "测试标题", clickable={"测试标题"})
+    if card_description:
+        profile = '<hierarchy><node text="小红书号：expected-user" /><node text="编辑资料" /><node content-desc="视频,测试标题,来自作者,0赞，0阅读" clickable="true" /></hierarchy>'
+    fake = _FakeDevice([
+        _hierarchy("首页", "我"),
+        profile,
+        _hierarchy("测试标题", "审核正文", "分享"),
+    ], packages=["com.xingin.xhs"] * 3)
+    _prepare_monkeypatch(monkeypatch, fake)
+    monkeypatch.setattr(publishing, "open_account_profile", lambda **_kwargs: None)
+    monkeypatch.setattr(publishing, "_copy_published_link", lambda *_args: (
+        "https://www.xiaohongshu.com/explore/1234567890abcdef", "1234567890abcdef"))
+    result = publishing.detect_published_work(serial="ABC123", platform="xiaohongshu",
+        account_identifier="expected-user", title="测试标题", canceled=lambda: False, app_config=config)
+    assert result["work_id"] == "1234567890abcdef"
+    assert fake.actions == [("click", {"description": "视频,测试标题,来自作者,0赞，0阅读"} if card_description else {"resourceId": "id/2"})]
 
 
 def test_failed_intent_commit_never_clicks(monkeypatch):
@@ -357,6 +380,36 @@ def test_unknown_submit_cannot_resume_or_cancel_without_explicit_nonpublication_
         json={"confirmed_not_published": True, "notes": "已在平台核验未发布"},
     )
     assert canceled.status_code == 200 and canceled.json()["status"] == "CANCELED"
+
+
+def test_finish_declaration_records_intent_and_prevents_a_second_click(client, engine, approved_content, monkeypatch):
+    jobs = _approve_automatic(client, approved_content, platforms=("xiaohongshu",))
+    with Session(engine) as session:
+        publication = session.scalar(select(Publication).where(Publication.job_id == jobs[0]))
+        identifier = publication.id
+        publication.status = "VERIFYING"
+        publication.reserved_serial = publication.snapshot["account"]["device_serial"]
+        publication.evidence = {"submit_started_at": datetime.now(UTC).isoformat(), "final_publish_clicked": False}
+        job = session.get(Job, jobs[0])
+        job.status, job.error_code = "WAITING_USER", "CONTENT_DECLARATION_UNCONFIRMED"
+        session.commit()
+    calls = []
+
+    def finish(**kwargs):
+        kwargs["record_submit"]("intent")
+        with Session(engine) as session:
+            assert session.get(Publication, identifier).evidence["declaration_confirm_started_at"]
+        calls.append("click")
+        kwargs["record_submit"]("clicked")
+
+    monkeypatch.setattr(publishing, "finish_pending_declaration", finish)
+    path = f"/api/v1/publications/{identifier}/finish-declaration"
+    assert client.post(path, json={"confirmed": False}).status_code == 422
+    response = client.post(path, json={"confirmed": True})
+    assert response.status_code == 200, response.text
+    assert response.json()["evidence"]["final_publish_clicked"] is True
+    assert client.post(path, json={"confirmed": True}).status_code == 409
+    assert calls == ["click"]
 
 
 @pytest.mark.parametrize("published", [False, True])

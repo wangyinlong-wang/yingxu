@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from .config import AppConfig, default_settings
+from .config import AppConfig, default_model_profile, default_settings
 from .models import Setting, Source, Template
 
 
@@ -81,8 +81,22 @@ def settings(session: Session, config: AppConfig | None = None) -> dict:
     # New optional capability fields acquire their documented defaults when reading older local settings.
     for kind, values in defaults["models"].items():
         current.setdefault("models", {}).setdefault(kind, {})
+        model = current["models"][kind]
         for key, value in values.items():
-            current["models"][kind].setdefault(key, value)
+            if key not in {"local", "source"}:
+                model.setdefault(key, value)
+        # Older records predate per-source profiles: a stored local_ai.voice_enabled=true keeps
+        # selecting the builtin speech engine until the user saves an explicit source choice.
+        if "source" not in model:
+            model["source"] = (
+                "builtin"
+                if kind == "speech" and current.get("local_ai", {}).get("voice_enabled")
+                else "third_party"
+            )
+        local = model.setdefault("local", {})
+        for key, value in default_model_profile(kind).items():
+            local.setdefault(key, value)
+        local["protocol"] = "openai"
     for key, value in defaults["video"].items():
         current.setdefault("video", {}).setdefault(key, value)
     for key, value in defaults["publishing"].items():

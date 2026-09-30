@@ -191,6 +191,7 @@ def job_dict(session: Session, job: Job, detail: bool = True) -> dict:
                     "cached_tokens",
                     "image_count",
                     "audio_seconds",
+                    "video_seconds",
                 }
                 and not isinstance(value, bool)
                 and isinstance(value, (int, float))
@@ -215,12 +216,14 @@ def job_dict(session: Session, job: Job, detail: bool = True) -> dict:
         )
     ]
     result["cost"] = {"estimated_usd": None, "actual_usd": None, "status": "UNKNOWN"}
-    result["requires_reconciliation"] = job.error_code == "RESTORE_REVIEW_REQUIRED" or bool(
-        session.scalar(
-            select(ModelCall.id).where(
-                ModelCall.job_id == job.id, ModelCall.status.in_(["STARTED", "UNKNOWN"])
-            )
-        )
+    pending = list(session.scalars(select(ModelCall).where(
+        ModelCall.job_id == job.id, ModelCall.status.in_(["STARTED", "UNKNOWN"])
+    )))
+    from .video_provider import resumable_video_call
+
+    result["can_resume_video"] = bool(pending) and all(resumable_video_call(call) for call in pending)
+    result["requires_reconciliation"] = job.error_code == "RESTORE_REVIEW_REQUIRED" or (
+        bool(pending) and not result["can_resume_video"]
     )
     result["blocking_job_id"] = job.result.get("details", {}).get("original_job_id")
     return result
@@ -229,6 +232,7 @@ def job_dict(session: Session, job: Job, detail: bool = True) -> dict:
 def publication_dict(publication: Publication) -> dict:
     result = row(publication)
     result["auto_publish"] = bool(publication.snapshot.get("auto_publish", False))
+    result["channel"] = publication.snapshot.get("account", {}).get("channel", "android")
     result.pop("snapshot", None)
     result.pop("reserved_serial", None)
     return result
@@ -388,6 +392,21 @@ def checked_asset(session: Session, config: AppConfig, asset_id: str, kinds: set
     return asset
 
 
+def checked_scene_audio(session: Session, config: AppConfig, content_id: str, scene: dict) -> list[Asset]:
+    assets = [checked_asset(session, config, item, {"audio", "video_clip"}) for item in scene["audio_asset_ids"]]
+    for asset in assets:
+        if asset.kind != "video_clip":
+            continue
+        if asset.content_id != content_id or asset.id != scene.get("video_asset_id") or len(assets) != 1:
+            raise AppError("INVALID_NATIVE_AUDIO", "视频原声只能单独使用当前内容所选视频的音轨", 422)
+        from .integrations.media import probe_media
+
+        metadata = probe_media(asset_path(config, asset))
+        if not metadata.get("has_audio") or metadata.get("duration", 0) <= 0:
+            raise AppError("MISSING_NATIVE_AUDIO", "所选视频没有可用原声音轨，请选择其他配音", 422)
+    return assets
+
+
 def local_voice_options(profile: dict) -> tuple[str, float, str]:
     voice_model = profile.get("voice_model", "qwen3")
     emotion_strength = profile.get("emotion_strength", 0.65)
@@ -458,12 +477,14 @@ def local_ai_profile_snapshot(
     include_voice: bool,
     include_avatar: bool,
     force_voice: bool = False,
+    force_avatar: bool = False,
+    include_portrait: bool = False,
 ) -> dict:
     """Freeze the effective local profile and artifact identities for a queued job."""
 
     profile = settings(session, config)["local_ai"]
     voice = include_voice and (bool(profile["voice_enabled"]) or force_voice)
-    avatar = include_avatar and bool(profile["avatar_enabled"])
+    avatar = include_avatar and (bool(profile["avatar_enabled"]) or force_avatar)
     voice_model, emotion_strength, voice_component = local_voice_options(profile)
     status = validate_local_ai_settings(
         session,
@@ -478,7 +499,14 @@ def local_ai_profile_snapshot(
         if voice
         else None
     )
-    portrait = checked_asset(session, config, profile["portrait_asset_id"], {"portrait"}) if avatar else None
+    portrait_required = avatar or include_portrait
+    if portrait_required and not profile.get("portrait_asset_id"):
+        raise AppError("LOCAL_AI_PORTRAIT_REQUIRED", "生成数字人前请上传本人肖像", 409)
+    portrait = (
+        checked_asset(session, config, profile["portrait_asset_id"], {"portrait"})
+        if portrait_required
+        else None
+    )
     snapshot = {
         "voice_enabled": voice,
         "avatar_enabled": avatar,
@@ -508,16 +536,34 @@ def local_ai_profile_snapshot(
     return snapshot
 
 
+def active_model(current: dict, kind: str) -> tuple[str, dict | None]:
+    """Resolve the selected source and its profile for one capability without side effects.
+
+    Returns ("third_party"|"local", profile dict) for HTTP profiles and ("builtin", None)
+    for the native speech engine, which dispatches through local_ai instead of invoke_model.
+    """
+
+    model = current.get("models", {}).get(kind, {})
+    source = model.get("source") or "third_party"
+    if source not in {"third_party", "local", "builtin"} or (source == "builtin" and kind != "speech"):
+        source = "third_party"
+    if source == "builtin":
+        return "builtin", None
+    if source == "local":
+        return "local", model.get("local") or {}
+    return "third_party", model
+
+
 def assert_models(session: Session, config: AppConfig, kinds: tuple[str, ...]) -> dict:
+    from .model_credentials import resolve_model_key
+
     current = settings(session, config)
-    missing = [
-        kind
-        for kind in kinds
-        if not (
-            (
-                kind == "speech"
-                and current["local_ai"]["voice_enabled"]
-                and validate_local_ai_settings(
+    missing = []
+    for kind in kinds:
+        source, profile = active_model(current, kind)
+        if source == "builtin":
+            ready = bool(
+                validate_local_ai_settings(
                     session,
                     config,
                     current["local_ai"],
@@ -526,16 +572,16 @@ def assert_models(session: Session, config: AppConfig, kinds: tuple[str, ...]) -
                     validate_references=False,
                 )
             )
-            or (
-                current["models"][kind]["enabled"]
-                and current["models"][kind]["base_url"]
-                and current["models"][kind]["model"]
-                and config.key(kind)
-            )
-        )
-    ]
+        elif not (profile.get("enabled") and profile.get("base_url") and profile.get("model")):
+            ready = False
+        elif source == "local":
+            ready = True
+        else:
+            ready = bool(resolve_model_key(config, kind, source, profile["base_url"])[0])
+        if not ready:
+            missing.append(kind)
     if missing:
-        names = {"text": "文本", "image": "图片", "speech": "配音"}
+        names = {"text": "文本", "image": "图片", "speech": "配音", "video": "视频"}
         raise AppError(
             "MODEL_NOT_CONFIGURED",
             "请先配置并启用模型能力：" + "、".join(names[k] for k in missing),

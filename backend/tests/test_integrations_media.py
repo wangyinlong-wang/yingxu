@@ -80,6 +80,44 @@ def test_compose_video_real_short_encode_with_unicode(deterministic_codec_fixtur
     assert result["voice_loudness_target_lufs"] == -16.0
 
 
+def test_card_scene_uses_full_frame_without_duplicate_heading(deterministic_codec_fixture, tmp_path):
+    _, audio_path = deterministic_codec_fixture
+    card = tmp_path / "source-card.png"
+    media.render_card(
+        scene_type="text_card",
+        visual_data={"headline": "Codex CLI 0.155.1", "body": "来源：Codex_Changelog\nAI 数字人演绎"},
+        destination=card,
+        width=320,
+        height=568,
+        palette=["#315bff", "#111827", "#f7f8fb", "#f2c94c"],
+        caption="来源与演绎说明",
+    )
+    result = compose_video(
+        title="片尾排版",
+        scenes=[{
+            "scene_type": "text_card",
+            "image_path": str(card),
+            "audio_segments": [{"path": str(audio_path), "text": "内容根据原帖整理，由人工智能数字人演绎。"}],
+            "caption": "来源与演绎说明",
+            "motion": "none",
+            "transition": "cut",
+        }],
+        output_dir=tmp_path / "rendered-card",
+        settings={"width": 320, "height": 568, "fps": 10},
+        progress=lambda *_: None,
+        canceled=lambda: False,
+    )
+    raw = subprocess.run(
+        [media._binary("ffmpeg"), "-v", "error", "-ss", "0.3", "-i", result["video_path"],
+         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    frame = Image.frombytes("RGB", (320, 568), raw)
+    assert frame.getpixel((50, round(568 * 0.325)))[2] > 100  # Full-width accent rule is visible.
+    assert max(max(frame.getpixel((x, y))) for x in range(100, 220, 10) for y in range(20, 100, 10)) < 100
+
+
 def test_srt_uses_each_audio_segments_actual_duration(deterministic_codec_fixture, tmp_path):
     image_path, first_audio = deterministic_codec_fixture
     ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
@@ -569,3 +607,68 @@ def test_ffmpeg_process_is_reaped_on_worker_interrupt(monkeypatch):
 
     assert process.terminated is True
     assert process.waited is True
+
+
+@pytest.mark.parametrize("native_audio", [False, True])
+def test_generated_video_clip_holds_last_frame_and_keeps_narration(deterministic_codec_fixture, tmp_path, native_audio):
+    image_path, audio_path = deterministic_codec_fixture
+    clip = tmp_path / "red-clip.mp4"
+    subprocess.run(
+        [
+            shutil.which("ffmpeg"),
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=160x240:r=10:d=0.3",
+            *(["-i", str(audio_path), "-c:a", "aac"] if native_audio else []),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(clip),
+        ],
+        check=True,
+    )
+    result = compose_video(
+        title="视频素材回归",
+        scenes=[
+            {
+                "image_path": str(image_path),
+                "video_path": str(clip),
+                "audio_segments": [{"path": str(clip if native_audio else audio_path), "text": "保留原旁白"}],
+                "caption": "",
+                "transition": "cut",
+            }
+        ],
+        output_dir=tmp_path / "video-clip-output",
+        settings={"width": 160, "height": 240, "fps": 10},
+        progress=lambda *_: None,
+        canceled=lambda: False,
+    )
+    metadata = probe_media(Path(result["video_path"]))
+    assert metadata["has_audio"] and metadata["video_codec"] == "h264"
+    assert abs(metadata["duration"] - 0.7) < 0.15
+    assert "保留原旁白" in Path(result["subtitle_path"]).read_text()
+    frame = tmp_path / "held.png"
+    subprocess.run(
+        [
+            shutil.which("ffmpeg"),
+            "-v",
+            "error",
+            "-y",
+            "-ss",
+            "0.5",
+            "-i",
+            result["video_path"],
+            "-frames:v",
+            "1",
+            str(frame),
+        ],
+        check=True,
+    )
+    with Image.open(frame) as picture:
+        red, green, blue = picture.convert("RGB").getpixel((80, 100))
+        assert red > 150 and green < 80 and blue < 80

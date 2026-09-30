@@ -192,7 +192,7 @@ class _SecurityFramework:
             raise _keychain_error(status)
         return True
 
-    def get(self, service: str, account: str) -> str | None:
+    def get(self, service: str, account: str, *, max_length: int = 12) -> str | None:
         result = ctypes.c_void_p()
         with self._query(service, account, return_data=True) as query:
             status = self.security.SecItemCopyMatching(query, ctypes.byref(result))
@@ -205,7 +205,7 @@ class _SecurityFramework:
         try:
             length = self.core.CFDataGetLength(result.value)
             pointer = self.core.CFDataGetBytePtr(result.value)
-            if length < 0 or length > 12 or (length and not pointer):
+            if length < 0 or length > max_length or (length and not pointer):
                 raise _error("DEVICE_KEYCHAIN_ERROR", "macOS 钥匙串返回的数据无效")
             try:
                 return ctypes.string_at(pointer, length).decode("ascii")

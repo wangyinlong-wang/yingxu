@@ -1,16 +1,17 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { onBeforeRouteLeave, useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { ArrowDown, ArrowDownBold, ArrowUpBold, CircleCheckFilled, VideoCamera } from '@element-plus/icons-vue';
 import { api } from '../api';
-import { actionKey, formatBytes, formatDate, isConflict, statusLabel } from '../lib';
+import { actionKey, formatBytes, formatDate, isConflict, statusLabel, whitelistedStatus } from '../lib';
 import { canApproveContent, cloneContent, contentFingerprint, contentPatch, contentPlatformIssues, normalizedContent, platformDescription, platformTextRules, platformTitleUnits, reorderedScenes, saveBeforeAction } from '../content-editor';
 import type { Asset, Content, Preset, QualityReview, Template } from '../types';
 import PageIntro from '../components/PageIntro.vue';
 import StatePanel from '../components/StatePanel.vue';
 import StatusTag from '../components/StatusTag.vue';
 const list = ref<Content[]>([]);
+const CONTENT_STATUSES = ['DRAFT','GENERATING','REVIEW_REQUIRED','APPROVED','REJECTED'] as const;
 const route = useRoute();
 const current = ref<Content | null>(null);
 const assets = ref<Asset[]>([]);
@@ -47,8 +48,10 @@ const briefBlocksScript = computed(() => briefConcepts.value.length > 0 && !brie
 const latestQualityReview = computed(() => current.value?.latest_quality_review ?? qualityReviews.value[0] ?? null);
 const readyToApprove = computed(() => current.value ? canApproveContent({ ...current.value, latest_quality_review:latestQualityReview.value }) : false);
 const allComplianceChecked = computed(() => Object.values(complianceChecks.value).every(Boolean));
+const remainingComplianceChecks = computed(() => Object.values(complianceChecks.value).filter(checked => !checked).length);
 const supportedSceneTypes = computed(() => selectedPreset.value?.supported_scene_types ?? ['image', 'text_card', 'stat_card', 'quote_card']);
 const images = computed(() => assets.value.filter(asset => asset.kind === 'image'));
+const videoClips = computed(() => assets.value.filter(asset => asset.kind === 'video_clip'));
 const audios = computed(() => assets.value.filter(asset => asset.kind === 'audio'));
 function updateListItem(content: Content) {
     const index = list.value.findIndex(item => item.id === content.id);
@@ -64,18 +67,25 @@ function applyRemote(content: Content, nextAssets?: Asset[]) {
     updateListItem(normalized);
     activeScene.value = Math.min(activeScene.value, Math.max(0, normalized.scenes.length - 1));
 }
+let listSeq = 0;
 async function loadList() {
+    const seq = ++listSeq;
     loading.value = true;
     error.value = '';
     try {
         const response = await api.contents(query.value, status.value);
+        if (seq !== listSeq)
+            return;
         list.value = response.items;
     }
     catch (exception: any) {
+        if (seq !== listSeq)
+            return;
         error.value = exception.message || '请检查本地服务是否已启动';
     }
     finally {
-        loading.value = false;
+        if (seq === listSeq)
+            loading.value = false;
     }
 }
 async function loadTemplates() {
@@ -166,9 +176,14 @@ function imageGenerationBlocker(sceneId?:string):string | undefined {
     return undefined;
 }
 async function generate(stage: string, sceneId?:string) {
+    let videoOptions:{clip_duration:number;clip_resolution:'768P'|'2K'}|undefined;
+    let avatarLayout:'corner'|'fullscreen'|undefined;
+    const submittedStage = stage === 'local_avatar_fullscreen' || stage === 'local_avatar_corner' ? 'local_avatar_all' : stage;
+    if (stage === 'local_avatar_fullscreen') avatarLayout = 'fullscreen';
+    if (stage === 'local_avatar_corner') avatarLayout = 'corner';
     if (!current.value || generating.value)
         return;
-    if (['script', 'all'].includes(stage) && briefBlocksScript.value) {
+    if (['script', 'all', 'local_avatar_all'].includes(submittedStage) && briefBlocksScript.value) {
         ElMessage.error('Production Brief 已生成，请先从三个方案中选择一个，再生成脚本。');
         return;
     }
@@ -183,6 +198,29 @@ async function generate(stage: string, sceneId?:string) {
             await ElMessageBox.confirm('将调用一次服务端已配置的文本模型，为每个镜头选择动画和转场，并用现有图片和音频重新合成视频。不会生成图片或声音；完成后内容需要重新审核。', 'AI 编排动画并合成', { confirmButtonText: '开始编排', cancelButtonText: '取消', type: 'warning' });
         }
         catch {
+            generating.value = false;
+            return;
+        }
+    }
+    else if (stage === 'video' || stage === 'local_avatar_fullscreen') {
+        generating.value = true;
+        try {
+            const configured = await api.settings();
+            const seconds = configured.video.clip_duration;
+            const resolution = configured.video.clip_resolution;
+            videoOptions = {clip_duration:seconds, clip_resolution:resolution};
+            const unitCost = seconds * (resolution === '2K' ? 0.15 : 0.09);
+            if (stage === 'local_avatar_fullscreen') {
+                const imageSceneCount = current.value.scenes.filter(scene => scene.scene_type === 'image').length;
+                const estimate = imageSceneCount ? `当前 ${imageSceneCount} 个图片镜头预计调用 ${imageSceneCount} 次，参考费用约 ¥${(unitCost * imageSceneCount).toFixed(2)}` : `将先生成脚本，再按其中每个图片镜头调用一次；单镜头参考费用约 ¥${unitCost.toFixed(2)}`;
+                await ElMessageBox.confirm(`将使用已配置的本人肖像和声音参考，生成 ${seconds} 秒 ${resolution} 的 MiniMax H3 全屏数字人镜头。${estimate}（以服务商实际计费为准）。图片镜头使用数字人视频原声，文字卡保留本地卡片并使用本人配音。取消本地任务不能保证服务商停止计费。`, '使用全屏数字人生成全部', { confirmButtonText: '确认生成', cancelButtonText: '取消', type: 'warning' });
+            } else {
+                await ElMessageBox.confirm(`将根据此分镜的画面提示词生成 ${seconds} 秒 ${resolution} 视频，Metaso 参考费用约 ¥${unitCost.toFixed(2)}（以实际计费为准）。完成后请预览片段并点击合成视频；沿用原旁白，较短片段会停留在末帧。取消本地任务不能保证服务商停止计费。`, '生成 AI 视频片段', { confirmButtonText: '确认生成', cancelButtonText: '取消', type: 'warning' });
+            }
+        } catch (exception:any) {
+            if (exception !== 'cancel' && exception !== 'close') {
+                ElMessage.error(exception.message || '无法读取视频配置，请稍后重试。');
+            }
             generating.value = false;
             return;
         }
@@ -210,7 +248,7 @@ async function generate(stage: string, sceneId?:string) {
     try {
         const contentId = current.value.id;
         const submitted = await runAfterSave(async () => {
-            await api.generate(contentId, stage, actionKey(), sceneId);
+            await api.generate(contentId, submittedStage, actionKey(), sceneId, videoOptions, avatarLayout);
         });
         if (submitted) {
             ElMessage.success('生成任务已提交。编辑器会在没有未保存修改时自动刷新当前视频和状态。');
@@ -379,10 +417,22 @@ onBeforeRouteLeave(async () => {
     return choice !== 'save' || await save();
 });
 onMounted(async () => {
+    status.value = whitelistedStatus(route.query.status, CONTENT_STATUSES);
     await Promise.all([loadList(), loadTemplates(), loadPresets()]);
     if (typeof route.query.content_id === 'string')
         await selectRemote(route.query.content_id);
     pollTimer.value = window.setInterval(pollCurrent, 5000);
+});
+watch(() => route.query.status, value => {
+    const next = whitelistedStatus(value, CONTENT_STATUSES);
+    if (next !== status.value) {
+        status.value = next;
+        loadList();
+    }
+});
+watch(() => route.query.content_id, value => {
+    if (typeof value === 'string' && value && value !== current.value?.id)
+        requestSelect(value);
 });
 onBeforeUnmount(() => { if (pollTimer.value)
     clearInterval(pollTimer.value); });
@@ -395,20 +445,26 @@ onBeforeUnmount(() => { if (pollTimer.value)
 <div class="workspace">
   <aside class="master">
     <div class="filter-row">
-      <el-input v-model="query" placeholder="搜索内容" clearable @change="loadList" />
-      <el-select
-        v-model="status"
-        placeholder="全部状态"
-        clearable
-        @change="loadList"
-      >
-        <el-option
-          v-for="value in ['DRAFT','GENERATING','REVIEW_REQUIRED','APPROVED','REJECTED']"
-          :key="value"
-          :value="value"
-          :label="value"
-        />
-      </el-select>
+      <label class="filter-field">
+        <span>搜索</span>
+        <el-input v-model="query" placeholder="搜索内容" clearable @change="loadList" />
+      </label>
+      <label class="filter-field">
+        <span>状态</span>
+        <el-select
+          v-model="status"
+          placeholder="全部状态"
+          clearable
+          @change="loadList"
+        >
+          <el-option
+            v-for="value in CONTENT_STATUSES"
+            :key="value"
+            :value="value"
+            :label="statusLabel(value)"
+          />
+        </el-select>
+      </label>
     </div>
     <StatePanel
       :loading
@@ -435,7 +491,15 @@ onBeforeUnmount(() => { if (pollTimer.value)
     </StatePanel>
   </aside>
   <section class="detail">
-    <el-empty v-if="!current && !detailLoading" description="从左侧选择一条内容开始编辑" />
+    <div v-if="!current && !detailLoading" class="empty-guide">
+      <el-icon aria-hidden="true">
+        <VideoCamera />
+      </el-icon>
+      <p>从内容列表选择一条内容开始编辑；<br>还没有内容时，先到选题库把候选选题转为草稿。</p>
+      <RouterLink to="/sources">
+        <el-button type="primary" plain>前往选题库</el-button>
+      </RouterLink>
+    </div>
     <el-skeleton v-else-if="detailLoading" :rows="8" animated />
     <template v-else-if="current">
       <div class="content-head">
@@ -464,6 +528,8 @@ onBeforeUnmount(() => { if (pollTimer.value)
               <el-dropdown-menu>
                 <el-dropdown-item command="brief">生成 Production Brief（3 个方案）</el-dropdown-item>
                 <el-dropdown-item command="all">生成全部</el-dropdown-item>
+                <el-dropdown-item command="local_avatar_fullscreen">使用本人声音和全屏数字人生成全部</el-dropdown-item>
+                <el-dropdown-item command="local_avatar_corner">使用本人声音和右下角数字人生成全部</el-dropdown-item>
                 <el-dropdown-item command="script">仅脚本</el-dropdown-item>
                 <el-dropdown-item command="assets">仅素材</el-dropdown-item>
                 <el-dropdown-item command="render">仅渲染视频</el-dropdown-item>
@@ -613,6 +679,14 @@ onBeforeUnmount(() => { if (pollTimer.value)
                     <el-option v-for="asset in images" :key="asset.id" :value="asset.id" :label="asset.filename" />
                   </el-select>
                 </el-form-item>
+                <el-form-item v-if="current.scenes[activeScene].scene_type==='image'" label="AI 视频素材">
+                  <el-select v-model="current.scenes[activeScene].video_asset_id" clearable placeholder="未选择时使用图片">
+                    <el-option v-for="asset in videoClips" :key="asset.id" :value="asset.id" :label="asset.filename"/>
+                  </el-select>
+                  <el-button :disabled="generating || saving || !current.scenes[activeScene].image_prompt.trim()" @click="generate('video', current.scenes[activeScene].id)">生成本镜头 AI 视频</el-button>
+                  <video v-if="current.scenes[activeScene].video_asset_id" controls preload="metadata" style="max-width:100%;max-height:320px" :src="videoClips.find(asset=>asset.id===current!.scenes[activeScene].video_asset_id)?.url"/>
+                  <p class="form-help">AI 画面请核实后合成；清除选择可恢复图片画面。数字人口播可在下方单独选择视频原声，保留口型同步。</p>
+                </el-form-item>
                 <el-form-item label="音频素材">
                   <el-select
                     v-model="current.scenes[activeScene].audio_asset_ids"
@@ -620,6 +694,7 @@ onBeforeUnmount(() => { if (pollTimer.value)
                     clearable
                     placeholder="选择已上传音频"
                   >
+                    <el-option v-if="current.scenes[activeScene].video_asset_id" :value="current.scenes[activeScene].video_asset_id!" label="使用所选 AI 视频原声（单独选择）" />
                     <el-option v-for="asset in audios" :key="asset.id" :value="asset.id" :label="asset.filename" />
                   </el-select>
                 </el-form-item>
@@ -796,11 +871,26 @@ onBeforeUnmount(() => { if (pollTimer.value)
     </template>
   </section>
 </div>
-<el-dialog v-model="approvalDialog" title="确认通过" width="min(620px, calc(100% - 32px))">
+<el-dialog v-model="approvalDialog" title="确认通过" class="approval-dialog" width="min(620px, calc(100% - 32px))">
   <el-alert type="warning" :closable="false" title="请逐项完成合规确认。系统不以关键词扫描替代你的版权或平台规则判断。" />
   <el-alert v-if="approvalAutomatic" type="error" :closable="false" title="当前已开启审核后自动发布：通过后将自动上传并发布到已绑定账号。" />
   <el-alert v-else type="info" :closable="false" title="当前为手动准备模式：通过审核不会点击平台最终发布按钮。" />
-  <el-form label-position="top" class="compliance-form"><el-form-item label="结构化合规清单"><el-checkbox v-model="complianceChecks.source_rights_confirmed">已确认来源与素材使用权</el-checkbox><el-checkbox v-model="complianceChecks.no_unauthorized_material">不含未获授权材料</el-checkbox><el-checkbox v-model="complianceChecks.claims_not_exaggerated">事实主张未夸大</el-checkbox><el-checkbox v-model="complianceChecks.no_offplatform_diversion">不含站外导流</el-checkbox><el-checkbox v-model="complianceChecks.no_unverifiable_guarantees">不含不可验证承诺</el-checkbox><el-checkbox v-model="complianceChecks.ai_disclosure_confirmed">已确认 AI 辅助制作标识</el-checkbox><el-checkbox v-model="complianceChecks.platform_rules_checked">已按当前平台规则人工核对</el-checkbox><el-checkbox v-model="complianceChecks.visuals_manually_reviewed">已人工复核画面、文案与素材</el-checkbox></el-form-item><el-form-item label="审核说明（可选）"><el-input v-model="approvalNotes" type="textarea" :rows="3" placeholder="审核说明" /></el-form-item></el-form>
+  <el-form label-position="top" class="compliance-form">
+    <el-form-item label="结构化合规清单">
+      <div class="approval-checklist">
+        <el-checkbox v-model="complianceChecks.source_rights_confirmed">已确认来源与素材使用权</el-checkbox>
+        <el-checkbox v-model="complianceChecks.no_unauthorized_material">不含未获授权材料</el-checkbox>
+        <el-checkbox v-model="complianceChecks.claims_not_exaggerated">事实主张未夸大</el-checkbox>
+        <el-checkbox v-model="complianceChecks.no_offplatform_diversion">不含站外导流</el-checkbox>
+        <el-checkbox v-model="complianceChecks.no_unverifiable_guarantees">不含不可验证承诺</el-checkbox>
+        <el-checkbox v-model="complianceChecks.ai_disclosure_confirmed">已确认 AI 辅助制作标识</el-checkbox>
+        <el-checkbox v-model="complianceChecks.platform_rules_checked">已按当前平台规则人工核对</el-checkbox>
+        <el-checkbox v-model="complianceChecks.visuals_manually_reviewed">已人工复核画面、文案与素材</el-checkbox>
+      </div>
+      <p class="approval-progress" aria-live="polite">{{ remainingComplianceChecks ? `还需确认 ${remainingComplianceChecks} 项，完成后才能通过审核` : '八项已确认，可以通过审核' }}</p>
+    </el-form-item>
+    <el-form-item label="审核说明（可选）"><el-input v-model="approvalNotes" type="textarea" :rows="3" placeholder="审核说明" /></el-form-item>
+  </el-form>
   <template #footer><el-button @click="approvalDialog=false">取消</el-button><el-button type="success" :loading="approving" :disabled="!allComplianceChecked" @click="submitApproval">已核对，通过</el-button></template>
 </el-dialog>
 </template>

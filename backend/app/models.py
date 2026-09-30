@@ -33,6 +33,11 @@ class Source(Record, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_collected_at: Mapped[str | None] = mapped_column(String(40))
     last_error: Mapped[str | None] = mapped_column(Text)
+    keywords: Mapped[list] = mapped_column(JSON, default=list)
+    options: Mapped[dict] = mapped_column(JSON, default=dict)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_success_at: Mapped[str | None] = mapped_column(String(40))
+    next_eligible_at: Mapped[str | None] = mapped_column(String(40))
 
 
 class Topic(Record, Base):
@@ -47,6 +52,8 @@ class Topic(Record, Base):
     relevance_score: Mapped[float] = mapped_column(Float, default=0)
     selection_reason: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(20), default="NEW", index=True)
+    cluster_size: Mapped[int] = mapped_column(Integer, default=1)
+    related: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class Template(Record, Base):
@@ -152,6 +159,7 @@ class Account(Record, Base):
     display_name: Mapped[str] = mapped_column(String(200))
     account_identifier: Mapped[str] = mapped_column(String(200))
     device_serial: Mapped[str] = mapped_column(String(200))
+    channel: Mapped[str] = mapped_column(String(20), default="android", server_default="android")
 
 
 class Publication(Record, Base):
@@ -243,6 +251,8 @@ class Schedule(Record, Base):
     last_run_at: Mapped[str | None] = mapped_column(String(40))
     last_scheduled_date: Mapped[str | None] = mapped_column(String(10))
     next_run_at: Mapped[str | None] = mapped_column(String(40))
+    interval_minutes: Mapped[int | None] = mapped_column(Integer)
+    include_paid: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class ModelCall(Record, Base):

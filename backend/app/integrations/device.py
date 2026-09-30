@@ -9,14 +9,21 @@ Selectors vary by app version; unknown pages deliberately stop for the operator.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.resources
+import ipaddress
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
+import string
 import subprocess
+import sys
+import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
@@ -109,6 +116,8 @@ _CAPTCHA_MARKERS = ("滑块验证", "请完成验证", "安全验证", "图形�
 _PERMISSION_MARKERS = ("允许", "仅在使用该应用时允许", "始终允许", "不允许")
 _PICKER_MARKERS = ("最近项目", "所有照片", "相册", "选择照片", "选择视频")
 _NEXT_LABELS = ("下一步", "完成", "确定")
+_QR_LOCK = threading.Lock()
+_QR_SESSION: dict[str, Any] | None = None
 
 
 def _validate_serial(serial: str) -> str:
@@ -173,6 +182,209 @@ def list_devices() -> list[dict]:
             item["model"] = details["model"]
         devices.append(item)
     return devices
+
+
+def _mdns_services(adb: str) -> list[tuple[str, str, str, int]]:
+    try:
+        output = _run_command([adb, "mdns", "services"], timeout=5)
+    except IntegrationError:
+        return []
+    services = []
+    for line in output.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        host, separator, raw_port = parts[2].rpartition(":")
+        if not separator or not raw_port.isdecimal() or not 1 <= int(raw_port) <= 65535:
+            continue
+        try:
+            address = ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
+            continue
+        if address.is_private and not address.is_loopback and not address.is_link_local:
+            services.append((parts[0], parts[1].rstrip("."), host, int(raw_port)))
+    return services
+
+
+def _wireless_services(adb: str, ip: str) -> list[tuple[str, int]]:
+    return [
+        (name, port)
+        for name, kind, host, port in _mdns_services(adb)
+        if kind == "_adb-tls-connect._tcp" and host == ip
+    ]
+
+
+def connect_wireless_device(ip: str, connection_port: int) -> dict:
+    adb = _adb_binary()
+    if not adb:
+        raise IntegrationError("ADB_NOT_FOUND", "未安装 Android platform-tools")
+    address = f"{ip}:{connection_port}"
+    try:
+        _run_command([adb, "connect", address], timeout=15)
+    except IntegrationError as exc:
+        raise IntegrationError("ADB_CONNECT_FAILED", "连接失败，请核对无线调试主页面的 IP 和连接端口") from exc
+    connected = [item for item in list_devices() if item["state"] == "device"]
+    exact = next((item for item in connected if item["serial"] == address), None)
+    if exact:
+        return {"serial": exact["serial"], "state": "device"}
+    aliases = {
+        f"{instance}._adb-tls-connect._tcp"
+        for instance, port in _wireless_services(adb, ip)
+        if port == connection_port
+    }
+    matched = next((item for item in connected if item["serial"] in aliases), None)
+    if not matched:
+        raise IntegrationError("ADB_CONNECT_FAILED", "连接后设备仍未就绪，请保持无线调试开启并核对连接端口")
+    return {"serial": matched["serial"], "state": "device"}
+
+
+def _pair_at(adb: str, address: str, secret: str) -> None:
+    try:
+        # The code must not appear in argv, process listings, logs or error responses.
+        paired = subprocess.run(
+            [adb, "pair", address],
+            input=(secret + "\n").encode(),
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise IntegrationError("ADB_PAIR_TIMEOUT", "无线配对超时，请检查手机配对弹窗和网络") from exc
+    except OSError as exc:
+        raise IntegrationError("ADB_FAILED", "无法启动 Android 设备命令") from exc
+    if paired.returncode != 0:
+        raise IntegrationError("ADB_PAIR_FAILED", "无线配对失败，请检查配对码、配对端口及手机弹窗是否仍打开")
+
+
+def _after_pair(adb: str, ip: str, pairing_port: int, connection_port: int | None) -> dict:
+    if not connection_port or connection_port == pairing_port:
+        for attempt in range(3):
+            ports = {port for _, port in _wireless_services(adb, ip) if port != pairing_port}
+            if len(ports) == 1:
+                connection_port = ports.pop()
+                break
+            if len(ports) > 1:
+                break
+            if attempt < 2:
+                time.sleep(0.5)
+    if connection_port and connection_port != pairing_port:
+        try:
+            return {"paired": True, "connected": True, **connect_wireless_device(ip, connection_port)}
+        except IntegrationError:
+            pass
+    return {"paired": True, "connected": False, "serial": None}
+
+
+def pair_wireless_device(ip: str, pairing_port: int, connection_port: int | None, pairing_code: str) -> dict:
+    """Pair using one-time stdin input, then find and verify the ADB transport."""
+
+    adb = _adb_binary()
+    if not adb:
+        raise IntegrationError("ADB_NOT_FOUND", "未安装 Android platform-tools")
+    services = [item for item in _mdns_services(adb) if item[2] == ip]
+    connect_ports = {port for _, kind, _, port in services if kind == "_adb-tls-connect._tcp"}
+    if pairing_port in connect_ports:
+        pair_ports = {port for _, kind, _, port in services if kind == "_adb-tls-pairing._tcp"}
+        if len(pair_ports) != 1:
+            raise IntegrationError("ADB_PAIR_PORT_IS_CONNECT", "填入的是连接端口；请打开手机配对弹窗并填写弹窗中的端口")
+        connection_port = connection_port or pairing_port
+        pairing_port = pair_ports.pop()
+    _pair_at(adb, f"{ip}:{pairing_port}", pairing_code)
+    return _after_pair(adb, ip, pairing_port, connection_port)
+
+
+def _render_pairing_qr(payload: str) -> bytes:
+    swift = shutil.which("swift")
+    if sys.platform != "darwin" or not swift:
+        raise IntegrationError("QR_UNAVAILABLE", "本机缺少二维码生成环境，请使用配对码方式")
+    cache = Path(tempfile.gettempdir()) / "yingxu-qr-swift-cache"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise IntegrationError("QR_UNAVAILABLE", "无法生成配对二维码，请使用配对码方式") from exc
+    env = os.environ.copy()
+    env.update({
+        "TMPDIR": str(cache),
+        "SWIFT_MODULE_CACHE_PATH": str(cache / "swift-modules"),
+        "CLANG_MODULE_CACHE_PATH": str(cache / "clang-modules"),
+    })
+    try:
+        result = subprocess.run(
+            [swift, str(Path(__file__).with_name("adb_pair_qr.swift"))],
+            input=payload.encode(), capture_output=True, check=False, timeout=90, env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise IntegrationError("QR_UNAVAILABLE", "无法生成配对二维码，请使用配对码方式") from exc
+    if result.returncode != 0 or not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise IntegrationError("QR_UNAVAILABLE", "无法生成配对二维码，请使用配对码方式")
+    return result.stdout
+
+
+def start_wireless_qr() -> dict:
+    adb = _adb_binary()
+    if not adb:
+        raise IntegrationError("ADB_NOT_FOUND", "未安装 Android platform-tools")
+    alphabet = string.ascii_letters + string.digits
+    service = "studio-" + "".join(secrets.choice(alphabet) for _ in range(10))
+    secret = "".join(secrets.choice(alphabet) for _ in range(10))
+    payload = f"WIFI:T:ADB;S:{service};P:{secret};;"
+    png = _render_pairing_qr(payload)
+    token = secrets.token_urlsafe(24)
+    global _QR_SESSION
+    with _QR_LOCK:
+        _QR_SESSION = {
+            "token": token, "service": service, "secret": secret,
+            "expires_at": time.monotonic() + 120, "busy": False, "result": None,
+        }
+    return {"session_id": token, "image": "data:image/png;base64," + base64.b64encode(png).decode(), "expires_in": 120}
+
+
+def poll_wireless_qr(token: str) -> dict:
+    global _QR_SESSION
+    with _QR_LOCK:
+        session = _QR_SESSION
+        if not session or session["token"] != token:
+            raise IntegrationError("QR_SESSION_NOT_FOUND", "二维码已失效，请重新生成")
+        if time.monotonic() >= session["expires_at"]:
+            _QR_SESSION = None
+            return {"status": "expired"}
+        if session["result"]:
+            return session["result"]
+        if session["busy"]:
+            return {"status": "waiting"}
+        session["busy"] = True
+    result = {"status": "waiting"}
+    try:
+        adb = _adb_binary()
+        if not adb:
+            result = {"status": "failed", "message": "未安装 Android platform-tools"}
+        else:
+            pairing = next(
+                (
+                    (host, port)
+                    for name, kind, host, port in _mdns_services(adb)
+                    if name == session["service"] and kind == "_adb-tls-pairing._tcp"
+                ),
+                None,
+            )
+            if pairing:
+                ip, port = pairing
+                try:
+                    _pair_at(adb, f"{ip}:{port}", session["secret"])
+                    connected = _after_pair(adb, ip, port, None)
+                    result = {"status": "connected" if connected["connected"] else "paired", "ip": ip,
+                              "serial": connected["serial"]}
+                except IntegrationError:
+                    result = {"status": "failed", "message": "扫码后配对失败，请重新生成二维码"}
+    finally:
+        with _QR_LOCK:
+            if _QR_SESSION is session:
+                session["busy"] = False
+                if result["status"] != "waiting":
+                    session["result"] = result
+                    session["secret"] = ""
+                    session["expires_at"] = time.monotonic() + 30
+    return result
 
 
 def _require_connected(serial: str) -> dict:
@@ -776,10 +988,10 @@ def clear_unlock_failure(serial: str, app_config: AppConfig | None = None) -> No
 
 
 def _credential_serial(transport_serial: str) -> str:
-    """Resolve a stable device identity when wireless ADB exposes only host:port."""
+    """Resolve a stable identity for wireless ADB host:port or mDNS transports."""
 
     transport_serial = _validate_serial(transport_serial)
-    if ":" not in transport_serial:
+    if ":" not in transport_serial and not transport_serial.endswith("._adb-tls-connect._tcp"):
         return transport_serial
     try:
         physical = _adb(
@@ -1004,10 +1216,11 @@ def inspect_device(serial: str, platform: str) -> dict:
     }
 
 
-def _douyin_album_item(
-    device: Any, nodes: list[dict], serial: str, remote: str, size: int, digest: str, canceled
+def _album_video_item(
+    device: Any, nodes: list[dict], serial: str, remote: str, size: int, digest: str, canceled,
+    *, platform: str = "douyin",
 ) -> tuple[dict | None, list[dict]]:
-    """Douyin 40.4: isolate one hash-verified video in its own named album."""
+    """Isolate one hash-verified video in its own named album before selecting it."""
     folder = f"lp_{digest[:16]}"
     expected = f"/storage/emulated/0/Movies/LocalPublisher/{folder}/{folder}.mp4"
     if remote != expected.replace("/storage/emulated/0", "/sdcard"):
@@ -1029,6 +1242,33 @@ def _douyin_album_item(
         return None, nodes
     if _is_canceled(canceled):
         raise CanceledError()
+    if platform == "xiaohongshu":
+        if folder not in _tokens(nodes):
+            headings = [node for node in nodes if node.get("text") == "全部"
+                        and node.get("class_name") == "android.widget.TextView"
+                        and node.get("parent_clickable")]
+            if len(headings) != 1:
+                return None, nodes
+            _click_selected(device, device(text="全部", className="android.widget.TextView"))
+            time.sleep(_WAIT_AFTER_NAVIGATION)
+            _page, package, nodes = _guarded_page(device, platform)
+            if package != _PLATFORMS[platform]["package"] or not _click_unique(device, nodes, (folder,)):
+                return None, nodes
+            time.sleep(_WAIT_AFTER_NAVIGATION)
+            _page, package, nodes = _guarded_page(device, platform)
+        if folder not in _tokens(nodes) or not _click_unique(device, nodes, ("视频",)):
+            return None, nodes
+        time.sleep(_WAIT_AFTER_NAVIGATION)
+        page, package, nodes = _guarded_page(device, platform)
+        if page != "picker" or package != _PLATFORMS[platform]["package"] or folder not in _tokens(nodes):
+            return None, nodes
+        items = [node for node in nodes if node.get("package_name") == package
+                 and node.get("class_name") == "android.widget.ImageView"
+                 and node.get("clickable") and not node.get("description")]
+        durations = [node for node in nodes if node.get("package_name") == package
+                     and node.get("class_name") == "android.widget.TextView"
+                     and re.fullmatch(r"\d+:\d{2}", node.get("text", ""))]
+        return (durations[0] if len(items) == len(durations) == 1 else None), nodes
     if folder not in _tokens(nodes):
         if not _click_unique(device, nodes, ("所有照片",)):
             return None, nodes
@@ -1052,7 +1292,10 @@ def _douyin_album_item(
     durations = [
         node
         for node in nodes
-        if node.get("resource_id") == "com.ss.android.ugc.aweme:id/gc9"
+        if node.get("resource_id") in {
+            "com.ss.android.ugc.aweme:id/gc9", "com.ss.android.ugc.aweme:id/gc="
+        }
+        and node.get("parent_resource_id") == "com.ss.android.ugc.aweme:id/root_view"
         and re.fullmatch(r"\d+:\d{2}", node.get("text", ""))
     ]
     # A one-item media inventory and a one-item video grid must agree. Never pick
@@ -1144,6 +1387,32 @@ def prepare_upload(
     if page in {"login", "permission", "captcha", "locked"}:
         return _attention(page.upper(), evidence, page=page, detail="请用户完成当前页面后再继续准备")
 
+    # Older runs stopped at the chapter introduction before recording the selected
+    # hash; that exact post-selection result and visible introduction prove the stage.
+    resumed_selected_media = prior_valid and previous_evidence.get("page") == page and (
+        previous_evidence.get("selected_video_sha256") == video_sha256
+        or platform == "xiaohongshu" and app_version == "9.47.0"
+        and previous_evidence.get("reason") == "UNKNOWN_PAGE"
+        and previous_evidence.get("detail") == "素材选择后的下一步控件无法唯一识别"
+        and "添加章节，在视频上划重点！" in tokens
+    )
+    if resumed_selected_media:
+        evidence["selected_video_sha256"] = video_sha256
+        _mark_account_verified(evidence, account_identifier, str(previous_evidence["verified_at"]))
+        for _ in range(3):
+            if page == "editor":
+                break
+            if _is_canceled(canceled):
+                raise CanceledError()
+            labels = (("我知道了",) if "添加章节，在视频上划重点！" in tokens else _NEXT_LABELS)
+            if package != config["package"] or not _click_unique(device, nodes, labels):
+                return _attention("UNKNOWN_PAGE", evidence, page=page, detail="已选素材的编辑流程需要核验")
+            time.sleep(_WAIT_AFTER_NAVIGATION)
+            page, package, nodes = _guarded_page(device, platform)
+            tokens = _tokens(nodes)
+            if page in {"login", "permission", "captcha", "locked"}:
+                return _attention(page.upper(), evidence, page=page, detail="请用户完成当前页面后再继续准备")
+
     account_verified_now = page == "profile" and _account_visible(tokens, config, account_identifier)
     continuous_account_verification = False
     if not account_verified_now and page == "home":
@@ -1158,7 +1427,8 @@ def prepare_upload(
         page, package, nodes = _guarded_page(device, platform)
         tokens = _tokens(nodes)
         account_verified_now = page == "profile" and _account_visible(tokens, config, account_identifier)
-    if account_verified_now or prior_valid and page in {"picker", "editor"}:
+    resumed_camera = prior_valid and page == "camera" and previous_evidence.get("page") == "camera"
+    if account_verified_now or prior_valid and page in {"picker", "editor"} or resumed_camera:
         continuous_account_verification = True
     else:
         return _attention(
@@ -1186,7 +1456,7 @@ def prepare_upload(
                 str(previous_evidence.get("remote_video_path") or ""),
                 video_sha256,
             )
-        if not operator_media_confirmed and not _media_visible(tokens, video_sha256):
+        if not operator_media_confirmed and not resumed_selected_media and not _media_visible(tokens, video_sha256):
             return _attention(
                 "MEDIA_EVIDENCE_MISSING",
                 evidence,
@@ -1194,7 +1464,7 @@ def prepare_upload(
                 detail="编辑页未显示所选视频的唯一指纹，未执行任何发布操作",
             )
         if not _caption_visible(tokens, clean_caption, title=clean_title, description=clean_description):
-            if not account_verified_now and not operator_media_confirmed:
+            if not account_verified_now and not operator_media_confirmed and not resumed_selected_media:
                 return _attention(
                     "CAPTION_ENTRY_REQUIRED",
                     evidence,
@@ -1255,10 +1525,10 @@ def prepare_upload(
         page == "camera"
         and (
             platform == "douyin"
-            and app_version == "40.4.0"
+            and app_version in {"40.4.0", "40.5.0"}
             and _click_unique(device, nodes, ("相册",))
             or platform == "xiaohongshu"
-            and app_version == "9.46.0"
+            and app_version in {"9.46.0", "9.47.0"}
             and _click_unique(device, nodes, ("从相册选择",))
         )
     ):
@@ -1277,9 +1547,13 @@ def prepare_upload(
 
     fingerprint = video_sha256[:16]
     _emit_progress(progress, "定位相册并核验唯一视频", 40)
-    if platform == "douyin" and app_version == "40.4.0" and account_verified_now:
-        media_node, nodes = _douyin_album_item(
-            device, nodes, serial, video_remote, video.stat().st_size, video_sha256, canceled
+    if continuous_account_verification and (
+        platform == "douyin" and app_version in {"40.4.0", "40.5.0"}
+        or platform == "xiaohongshu" and app_version == "9.47.0"
+    ):
+        media_node, nodes = _album_video_item(
+            device, nodes, serial, video_remote, video.stat().st_size, video_sha256, canceled,
+            platform=platform,
         )
     else:
         media_node = _unique_node(nodes, (f"lp_{fingerprint}.mp4",), contains=True)
@@ -1293,7 +1567,7 @@ def prepare_upload(
     prior_picker_continuity = (
         account_verified_now
         or not prior_valid
-        or previous_evidence.get("page") == "picker"
+        or previous_evidence.get("page") in {"camera", "picker"}
         and previous_evidence.get("remote_video_path") == video_remote
     )
     if not prior_picker_continuity:
@@ -1303,12 +1577,18 @@ def prepare_upload(
             page=page,
             detail="上一轮证据无法证明当前媒体选择器与已核验账号连续",
         )
-    selected = _selector(device, media_node, nodes, require_clickable=True)
+    if platform == "xiaohongshu" and app_version == "9.47.0" and continuous_account_verification:
+        # XHS obfuscates ids and exposes no description for the video thumbnail.
+        # The single duration label lies inside the inventory-verified video tile.
+        selected = device(className="android.widget.TextView", text=media_node["text"])
+    else:
+        selected = _selector(device, media_node, nodes, require_clickable=True)
     if selected is None:
         return _attention(
             "MEDIA_SELECTION_REQUIRED", evidence, page=page, detail="唯一媒体条目没有可用的资源选择器"
         )
     _click_selected(device, selected)
+    evidence["selected_video_sha256"] = video_sha256
     _emit_progress(progress, "已选择唯一素材", 55)
     time.sleep(_WAIT_AFTER_NAVIGATION)
 
@@ -1322,7 +1602,9 @@ def prepare_upload(
             return _attention(page.upper(), evidence, page=page, detail="请用户完成当前页面后再继续准备")
         if page == "editor":
             break
-        if not _click_unique(device, nodes, _NEXT_LABELS):
+        labels = (("我知道了",) if platform == "xiaohongshu"
+                  and "添加章节，在视频上划重点！" in tokens else _NEXT_LABELS)
+        if not _click_unique(device, nodes, labels):
             return _attention(
                 "UNKNOWN_PAGE",
                 evidence,

@@ -36,6 +36,7 @@ export const cloneContent = <T>(value:T):T => JSON.parse(JSON.stringify(value))
 export function normalizedScene(scene:Scene):Scene {
   return {
     ...scene,
+    video_asset_id:scene.video_asset_id ?? null,
     motion:scene.motion ?? 'auto',
     transition:scene.transition ?? 'fade',
     scene_type:scene.scene_type ?? 'image',
@@ -56,7 +57,7 @@ export function contentFingerprint(content:Content):string {
     template_id:content.template_id,
     preset_id:content.preset_id ?? 'tech_brief_video_v1',
     script:content.script,
-    scenes:content.scenes.map(({id, order, narration, caption, highlight_terms, image_prompt, image_asset_id, audio_asset_ids, motion, transition, scene_type, visual_data, hero_moment, shot_intent}) => ({ id, order, narration, caption, highlight_terms:highlight_terms || [], image_prompt, image_asset_id:image_asset_id || null, audio_asset_ids, motion:motion ?? 'auto', transition:transition ?? 'fade', scene_type:scene_type ?? 'image', visual_data:{ headline:'', body:'', value:'', source_url:'', emphasis:'', ...visual_data }, hero_moment:hero_moment ?? false, shot_intent:shot_intent ?? '' }))
+    scenes:content.scenes.map(({id, order, narration, caption, highlight_terms, image_prompt, image_asset_id, video_asset_id, audio_asset_ids, motion, transition, scene_type, visual_data, hero_moment, shot_intent}) => ({ id, order, narration, caption, highlight_terms:highlight_terms || [], image_prompt, image_asset_id:image_asset_id || null, video_asset_id:video_asset_id || null, audio_asset_ids, motion:motion ?? 'auto', transition:transition ?? 'fade', scene_type:scene_type ?? 'image', visual_data:{ headline:'', body:'', value:'', source_url:'', emphasis:'', ...visual_data }, hero_moment:hero_moment ?? false, shot_intent:shot_intent ?? '' }))
   })
 }
 

@@ -133,8 +133,9 @@ def render_card(
     height: int,
     palette: list[str],
     font_path: str = "",
+    caption: str = "",
 ) -> None:
-    """Render a bounded plain-text vertical card without interpreting markup or expressions."""
+    """Render a full-frame editorial card from plain text."""
 
     if scene_type not in {"text_card", "stat_card", "quote_card"}:
         raise IntegrationError("INVALID_CARD_TYPE", "不支持的本地卡片类型")
@@ -154,57 +155,86 @@ def render_card(
         except OSError:
             return base_font
 
-    image = Image.new("RGB", (width, height), colors[1])
-    draw = ImageDraw.Draw(image, "RGBA")
-    draw.rounded_rectangle(
-        (round(width * 0.06), round(height * 0.10), round(width * 0.94), round(height * 0.90)),
-        radius=max(18, width // 24),
-        fill=colors[2],
-    )
-    accent = colors[3] if scene_type == "stat_card" else colors[0]
-    draw.rounded_rectangle(
-        (round(width * 0.10), round(height * 0.14), round(width * 0.90), round(height * 0.16)),
-        radius=max(4, width // 120),
-        fill=accent,
-    )
     headline = str(visual_data.get("headline") or "").strip()
     body = str(visual_data.get("body") or "").strip()
     value = str(visual_data.get("value") or "").strip()
     emphasis = str(visual_data.get("emphasis") or "").strip()
     if not any((headline, body, value)):
         raise IntegrationError("CARD_TEXT_REQUIRED", "卡片至少需要一项可见文字")
+    from PIL import ImageColor
 
-    left, right = round(width * 0.14), round(width * 0.86)
-    y = round(height * 0.22)
+    background = ImageColor.getrgb(colors[1])
+    bottom = tuple(
+        round(component * 0.82 + blue * 0.18)
+        for component, blue in zip(background, (42, 69, 93))
+    )
+    image = ImageOps.colorize(Image.linear_gradient("L").resize((width, height)), background, bottom)
+    draw = ImageDraw.Draw(image)
+    primary = ImageColor.getrgb(colors[2])
+    muted = tuple(round(component * 0.72 + dark * 0.28) for component, dark in zip(primary, background))
+    accent_color = ImageColor.getrgb(colors[3] if scene_type == "stat_card" else colors[0])
+    accent = tuple(round(component * 0.55 + 255 * 0.45) for component in accent_color)
+    left, right = round(width * 0.11), round(width * 0.89)
+    caption_label = " ".join(caption.split())
+    label = caption_label if caption_label and caption_label != headline else {
+        "text_card": "要点",
+        "stat_card": "数据",
+        "quote_card": "引述",
+    }[scene_type]
+    label_font = sized(max(18, round(width * 0.035)))
+    if draw.textlength(label, font=label_font) > right - left:
+        label = label[:18]
+        while label and draw.textlength(label + "…", font=label_font) > right - left:
+            label = label[:-1]
+        label += "…"
+    label_y = round(height * 0.275)
+    label_box = draw.textbbox((0, 0), label, font=label_font)
+    draw.text((left, label_y - label_box[1]), label, font=label_font, fill=muted)
+    rule_y = round(height * 0.325)
+    rule_color = tuple(round(a * 0.45 + b * 0.55) for a, b in zip(accent, background))
+    draw.line((left, rule_y, right, rule_y), fill=rule_color, width=max(1, width // 360))
+    draw.line((left, rule_y, left + round(width * 0.10), rule_y), fill=accent, width=max(2, width // 180))
 
-    def draw_wrapped(text: str, font, fill, *, spacing: int, max_lines: int) -> None:
-        nonlocal y
-        if not text:
-            return
-        lines = _wrap_title(draw, text, font, right - left)
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-            lines[-1] = lines[-1][:-1] + "…" if lines[-1] else "…"
+    def wrapped(text: str, font: ImageFont.ImageFont, limit: int) -> list[str]:
+        lines = []
+        for paragraph in text.splitlines():
+            lines.extend(_wrap_title(draw, paragraph, font, right - left) or [""])
+        if len(lines) > limit:
+            lines = lines[:limit]
+            while lines[-1] and draw.textlength(lines[-1] + "…", font=font) > right - left:
+                lines[-1] = lines[-1][:-1]
+            lines[-1] += "…"
+        return lines
+
+    blocks = []
+    for scale in (1.0, 0.9, 0.8, 0.7, 0.6):
+        blocks = []
+        for text, base_size, color, limit, gap in (
+            (headline, 0.072, primary, 4, 0.032),
+            (value if scene_type == "stat_card" else "", 0.125, accent, 3, 0.030),
+            (body, 0.049 if scene_type == "quote_card" else 0.043, primary if scene_type == "quote_card" else muted, 8, 0.025),
+            (emphasis, 0.037, accent, 3, 0.0),
+        ):
+            if text:
+                font = sized(max(16, round(width * base_size * scale)))
+                lines = wrapped(text, font, limit)
+                sample_box = draw.textbbox((0, 0), "国Ag", font=font)
+                line_height = max(1, sample_box[3] - sample_box[1])
+                spacing = round(width * 0.018 * scale)
+                block_height = len(lines) * line_height + max(0, len(lines) - 1) * spacing
+                blocks.append((lines, font, color, line_height, spacing, block_height, round(height * gap * scale)))
+        total_height = sum(block[5] + block[6] for block in blocks) - (blocks[-1][6] if blocks else 0)
+        if total_height <= height * 0.36:
+            break
+
+    y = max(round(height * 0.36), round(height * 0.52 - total_height / 2))
+    for lines, font, color, line_height, spacing, _block_height, gap in blocks:
         for line in lines:
-            box = draw.textbbox((0, 0), line, font=font)
-            height_value = max(1, box[3] - box[1])
-            draw.text((left, y), line, font=font, fill=fill)
-            y += height_value + spacing
-
-    draw_wrapped(headline, sized(max(28, width // 15)), colors[1], spacing=width // 40, max_lines=4)
-    if scene_type == "stat_card":
-        y += round(height * 0.04)
-        draw_wrapped(value, sized(max(42, width // 8)), accent, spacing=width // 28, max_lines=3)
-    elif scene_type == "quote_card":
-        quote_font = sized(max(32, width // 13))
-        y += round(height * 0.03)
-        draw.text((left, y), "“", font=sized(max(64, width // 6)), fill=accent)
-        y += round(height * 0.08)
-        draw_wrapped(body, quote_font, colors[1], spacing=width // 30, max_lines=9)
-        body = ""
-    draw_wrapped(body, sized(max(24, width // 20)), colors[1], spacing=width // 35, max_lines=10)
-    if emphasis:
-        draw_wrapped(emphasis, sized(max(20, width // 24)), accent, spacing=width // 40, max_lines=3)
+            if line:
+                box = draw.textbbox((0, 0), line, font=font)
+                draw.text((left, y - box[1]), line, font=font, fill=color)
+            y += line_height + spacing
+        y += gap - spacing
     destination.parent.mkdir(parents=True, exist_ok=True)
     image.save(destination, format="PNG", optimize=True)
 
@@ -788,9 +818,11 @@ def _write_ass(
     subtitle_terms=None,
     heading_terms=None,
     reserve_avatar=False,
+    card_cues=None,
 ):
     """Explicit video-sized coordinates avoid SubRip's default reference-resolution font scaling."""
     subtitle_size = max(8, round(width * 0.048))
+    card_subtitle_size = max(8, round(width * 0.036))
     heading_size = max(8, min(round(width * 0.060), round(height * 0.026)))
     side = max(10, round(width * 0.08))
     narration_right = round(width * 0.38) if reserve_avatar else side
@@ -805,6 +837,7 @@ def _write_ass(
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Narration,{font_name},{subtitle_size},&H00FFFFFF,&H00FFFFFF,&H00302010,&H90000000,0,0,0,0,100,100,0,0,1,2,1,2,{side},{narration_right},{round(height * 0.15)},1",
+        f"Style: CardNarration,{font_name},{card_subtitle_size},&H00FFFFFF,&H00FFFFFF,&H00302010,&H90000000,0,0,0,0,100,100,0,0,1,2,1,2,{side},{side},{round(height * 0.13)},1",
         f"Style: Heading,{font_name},{heading_size},&H00FFFFFF,&H00FFFFFF,&H00302010,&H90000000,-1,0,0,0,100,100,0,0,1,2,1,5,{side},{side},0,1",
         "",
         "[Events]",
@@ -821,12 +854,22 @@ def _write_ass(
             font = ImageFont.load_default()
         for index, (start, end, text) in enumerate(events):
             safe = _safe_srt_text(text).replace("\\", "＼")
-            right = narration_right if label == "Narration" else side
-            lines = _wrap_title(measuring, safe, font, width - side - right)
+            cue_is_card = label == "Narration" and bool(card_cues and card_cues[index])
+            event_label = "CardNarration" if cue_is_card else label
+            event_font = font
+            if cue_is_card:
+                try:
+                    event_font = ImageFont.truetype(
+                        str(font_path) if font_path else "DejaVuSans.ttf", card_subtitle_size
+                    )
+                except OSError:
+                    event_font = ImageFont.load_default()
+            right = narration_right if label == "Narration" and not cue_is_card else side
+            lines = _wrap_title(measuring, safe, event_font, width - side - right)
             if len(lines) > (3 if label == "Narration" else 4):
                 raise IntegrationError("CAPTION_TOO_LONG", "单段字幕或画面标题过长，请拆分短句后重新合成")
             styles.append(
-                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{label},,0,0,0,,"
+                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{event_label},,0,0,0,,"
                 + (rf"{{\pos({width // 2},{round(height * 0.11)})}}" if label == "Heading" else "")
                 + _emphasized_ass(lines, highlights[index] if highlights else [])
             )
@@ -877,10 +920,12 @@ def compose_video(
     zoom_max = _style_number(style, "zoom_max", 1.10, 1.0, 1.2)
     bgm_volume = _style_number(style, "bgm_volume", 0.12, 0.0, 0.3)
     image_paths: list[Path] = []
+    video_paths: list[Path | None] = []
     scene_audio: list[list[tuple[Path, float, str]]] = []
     subtitle_entries: list[tuple[float, float, str]] = []
     heading_entries: list[tuple[float, float, str]] = []
     subtitle_terms: list[list[str]] = []
+    card_cues: list[bool] = []
     heading_terms: list[list[str]] = []
     motions: list[str] = []
     transitions: list[str] = []
@@ -909,6 +954,13 @@ def compose_video(
         transitions.append(transition)
         image_path = _input_file(scene.get("image_path"), kind="场景图片")
         image_paths.append(image_path)
+        video_path = _input_file(scene["video_path"], kind="视频片段") if scene.get("video_path") else None
+        if video_path:
+            metadata = probe_media(video_path)
+            if not metadata.get("has_video") or metadata.get("duration", 0) <= 0:
+                raise IntegrationError("INVALID_VIDEO", "分镜视频没有有效画面")
+            total_input_bytes += video_path.stat().st_size
+        video_paths.append(video_path)
         total_input_bytes += image_path.stat().st_size
         segments = scene.get("audio_segments")
         if not isinstance(segments, list) or not segments or len(segments) > 100:
@@ -923,6 +975,7 @@ def compose_video(
         ):
             raise IntegrationError("INVALID_CAPTION", "字幕关键词格式无效")
         scene_start = total_duration
+        is_card = scene.get("scene_type") in {"text_card", "stat_card", "quote_card"}
         for segment in segments:
             if not isinstance(segment, dict):
                 raise IntegrationError("INVALID_AUDIO", "音频片段数据无效")
@@ -948,10 +1001,11 @@ def compose_video(
                 phrase_end = start + metadata["duration"] * elapsed_weight / total_weight
                 subtitle_entries.append((phrase_start, phrase_end, phrase))
                 subtitle_terms.append(terms)
+                card_cues.append(is_card)
             prepared_segments.append((audio_path, metadata["duration"], text))
             total_input_bytes += audio_path.stat().st_size
         scene_audio.append(prepared_segments)
-        if fallback_caption:
+        if fallback_caption and not is_card:
             heading_entries.append((scene_start, total_duration, fallback_caption))
             heading_terms.append(terms)
     if total_duration <= 0 or total_duration > 3_600:
@@ -1020,9 +1074,20 @@ def compose_video(
             subtitle_terms,
             heading_terms,
             bool(settings.get("avatar_enabled")),
+            card_cues,
         )
 
+        hypit_visual = None
+        if settings.get("renderer", "ffmpeg") == "hypit":
+            from .hypit import render_visual
+
+            hypit_visual = render_visual(
+                scenes=scenes, durations=[sum(item[1] for item in segments) for segments in scene_audio],
+                output_dir=destination / "hypit", settings=settings,
+                progress=progress, canceled=canceled,
+            )
         rendered_scenes: list[Path] = []
+        visual_offset = 0.0
         for index, (image_path, segments) in enumerate(zip(image_paths, scene_audio)):
             _check_canceled(canceled)
             audio_output = work / f"scene-{index:03d}.m4a"
@@ -1062,18 +1127,25 @@ def compose_video(
             scene_output = work / f"scene-{index:03d}.mp4"
             scene_image = work / f"scene-{index:03d}.png"
             motion = motions[index]
-            scene_zoom = 1.0 if motion == "none" else zoom_max
+            is_card = scenes[index].get("scene_type") in {"text_card", "stat_card", "quote_card"}
+            scene_zoom = 1.0 if is_card or motion == "none" else zoom_max
             pan_margin = (
                 min(width * 0.035, width * (scene_zoom - 1) / 2) if motion.startswith("pan_") else 0.0
             )
-            _scene_canvas(
-                image_path,
-                width,
-                height,
-                reserve_avatar=bool(settings.get("avatar_enabled")),
-                zoom_max=scene_zoom,
-                pan_margin=pan_margin,
-            ).save(scene_image, format="PNG")
+            if is_card:
+                with Image.open(image_path) as source:
+                    ImageOps.fit(source.convert("RGB"), (width, height), method=Image.Resampling.LANCZOS).save(
+                        scene_image, format="PNG"
+                    )
+            else:
+                _scene_canvas(
+                    image_path,
+                    width,
+                    height,
+                    reserve_avatar=bool(settings.get("avatar_enabled")),
+                    zoom_max=scene_zoom,
+                    pan_margin=pan_margin,
+                ).save(scene_image, format="PNG")
             fade = min(fade_seconds, scene_duration / 4) if transitions[index] == "fade" else 0.0
             frame_count = max(2, round(scene_duration * fps))
             eased = f"(0.5-0.5*cos(PI*min(on/{frame_count - 1},1)))"
@@ -1088,14 +1160,21 @@ def compose_video(
                 direction = 1 if motion == "pan_left" else -1
                 x += f"+{direction}*{pan_margin:.6f}/zoom*(2*{eased}-1)"
             video_filter = f"zoompan=z='{zoom}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={width}x{height}:fps={fps}"
+            video_input = ["-loop", "1", *_local_input(scene_image)]
+            if hypit_visual or video_paths[index]:
+                selected_video = hypit_visual or video_paths[index]
+                video_input = (["-ss", f"{visual_offset:.6f}"] if hypit_visual else []) + _local_input(selected_video)
+                video_filter = (
+                    f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+                    f"setsar=1,fps={fps},tpad=stop_mode=clone:stop_duration={scene_duration:.6f}"
+                )
+            visual_offset += scene_duration
             if fade > 0:
                 video_filter += f",fade=t=in:st=0:d={fade:.4f},fade=t=out:st={max(0.0, scene_duration - fade):.4f}:d={fade:.4f}"
             video_filter += ",format=yuv420p"
             _run_ffmpeg(
                 [
-                    "-loop",
-                    "1",
-                    *_local_input(scene_image),
+                    *video_input,
                     *_local_input(audio_output),
                     "-map",
                     "0:v:0",
@@ -1171,11 +1250,14 @@ def compose_video(
             filters.extend(
                 [
                     f"[{bgm_index}:a:0]volume={bgm_volume:.4f}[music]",
-                    "[voice][music]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+                    "[voice][music]amix=inputs=2:duration=first:dropout_transition=0[mixed]",
                 ]
             )
         else:
-            filters.append("[voice]anull[aout]")
+            filters.append("[voice]anull[mixed]")
+        # Normalize the complete programme after music is mixed; a single voice pass can
+        # land just outside the delivery range when clips have very different dynamics.
+        filters.append("[mixed]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
 
         final_arguments.extend(
             [

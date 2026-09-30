@@ -32,6 +32,14 @@ const voiceModelInstalled = (model:VoiceModel) => Boolean(status.value?.[voiceCo
 const hasVoiceInput = (model:VoiceModel) => Boolean(reference.value) && (model==='chatterbox'||Boolean(profile.value.reference_text?.trim()))
 const canPreviewVoice = computed(()=>!busy.value&&Boolean(testText.value.trim())&&hasVoiceInput(previewVoiceModel.value)&&voiceModelInstalled(previewVoiceModel.value)&&!status.value?.busy)
 const canUseFutureVoice = computed(()=>!busy.value&&hasVoiceInput(profileVoiceModel.value)&&voiceModelInstalled(profileVoiceModel.value)&&!status.value?.busy)
+// The native voice flag and the speech model source are one choice; keep the parent
+// settings object consistent so a full settings save never mixes engines.
+function syncSpeechSource(enabled:boolean) {
+  const speech=props.settings.models?.speech
+  if(!speech) return
+  if(enabled) speech.source='builtin'
+  else if(speech.source==='builtin') speech.source='third_party'
+}
 let timer:ReturnType<typeof setTimeout>|undefined
 let disposed = false
 const reasonText=(reason:string)=>({manifest_missing:'模型正在安装或尚未完成验证',manifest_invalid:'安装记录需要重新验证',component_not_installed:'该组件尚未完成安装验证',model_mismatch:'安装模型与当前配置不一致',runtime_missing:'本地运行环境缺失',model_missing:'模型文件尚未就绪'}[reason]||'本地环境需要检查')
@@ -199,7 +207,7 @@ onBeforeUnmount(()=>{disposed=true;if(timer)clearTimeout(timer)})
       <el-form-item v-if="profileVoiceModel==='chatterbox'" label="Chatterbox 表现力强度">
         <el-slider v-model="profile.emotion_strength" :min="0" :max="1" :step="0.05" show-input :disabled="busy"/>
       </el-form-item>
-      <el-form-item label="后续新旁白使用本地本人声音" class="future-voice-switch"><el-switch v-model="profile.voice_enabled" :disabled="!canUseFutureVoice"/></el-form-item>
+      <el-form-item label="后续新旁白使用本地本人声音" class="future-voice-switch"><el-switch v-model="profile.voice_enabled" :disabled="!canUseFutureVoice" @change="syncSpeechSource"/></el-form-item>
       <el-form-item label="在成片右下角叠加照片数字人"><el-switch v-model="profile.avatar_enabled" :disabled="busy||!portrait||!status?.avatar?.installed"/></el-form-item>
     </el-form>
     <p class="local-ai-help">这里保存的是后续新视频的模型选择。Qwen3 需要录音对应文字，Chatterbox 只需要参考录音；表现力强度只适用于 Chatterbox。已存在的配音，可在内容页明确替换后重新审核。</p>

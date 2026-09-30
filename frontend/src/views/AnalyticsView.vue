@@ -4,11 +4,12 @@ import { ElMessage } from 'element-plus';
 import { api } from '../api';
 import { actionKey, formatDate } from '../lib';
 import { latestMetricChange, metricLabels, metricSeries, observedAtIso, orderedMetrics, type MetricField } from '../analytics';
-import type { Metric, Publication } from '../types';
+import type { Account, AccountChannel, Metric, Publication } from '../types';
 import PageIntro from '../components/PageIntro.vue';
 import StatePanel from '../components/StatePanel.vue';
 const analytics = ref<any>();
 const publications = ref<Publication[]>([]);
+const accounts = ref<Account[]>([]);
 const selectedPublicationId = ref('');
 const publicationMetrics = ref<Metric[]>([]);
 const selectedField = ref<MetricField>('views');
@@ -18,6 +19,11 @@ const reportTimer = ref<number>();
 const reportCountAtSubmit = ref(0);
 const form = ref<any>({ publication_id: '', views: null, likes: null, comments: null, favorites: null, shares: null, observed_at: null as Date | null, notes: '' });
 const published = computed(() => publications.value.filter(publication => publication.status === 'PUBLISHED'));
+const selectedPublication = computed(() => publications.value.find(publication => publication.id === selectedPublicationId.value));
+const channelOf = (value?: { channel?: AccountChannel } | null): AccountChannel => value?.channel === 'browser' ? 'browser' : 'android';
+const collectChannel = computed(() => channelOf(
+    accounts.value.find(account => account.id === selectedPublication.value?.account_id) ?? selectedPublication.value
+));
 const orderedPublicationMetrics = computed(() => orderedMetrics(publicationMetrics.value));
 const series = computed(() => metricSeries(publicationMetrics.value, selectedField.value));
 const latestChange = computed(() => latestMetricChange(publicationMetrics.value, selectedField.value));
@@ -32,9 +38,10 @@ async function load() {
     loading.value = true;
     error.value = '';
     try {
-        const [analyticsResponse, publicationResponse] = await Promise.all([api.analytics(), api.publications()]);
+        const [analyticsResponse, publicationResponse, accountResponse] = await Promise.all([api.analytics(), api.publications(), api.accounts()]);
         analytics.value = analyticsResponse;
         publications.value = publicationResponse.items;
+        accounts.value = accountResponse.items;
         if (selectedPublicationId.value)
             await loadPublicationMetrics();
     }
@@ -88,7 +95,7 @@ async function collectMetrics() {
     collecting.value = true;
     try {
         await api.collectMetrics(selectedPublicationId.value, actionKey());
-        ElMessage.success('已提交设备读取任务，完成后会刷新该作品指标。');
+        ElMessage.success(collectChannel.value === 'browser' ? '已提交浏览器读取任务，完成后会刷新该作品指标。' : '已提交手机读取任务，完成后会刷新该作品指标。');
     }
     catch (exception: any) {
         ElMessage.error(exception.message);
@@ -179,7 +186,7 @@ onBeforeUnmount(() => { if (reportTimer.value)
             />
           </el-select>
         </el-form-item>
-        <el-button :loading="collecting" :disabled="!selectedPublicationId" @click="collectMetrics">从设备读取指标</el-button>
+        <el-button :loading="collecting" :disabled="!selectedPublicationId" @click="collectMetrics">{{collectChannel==='browser'?'从浏览器读取指标':'从手机读取指标'}}</el-button>
       </el-form>
       <el-empty v-if="!selectedPublicationId" description="选择一条已发布作品，查看每次真实观测。" :image-size="55"/>
       <template v-else>
@@ -225,7 +232,7 @@ onBeforeUnmount(() => { if (reportTimer.value)
             <template #default="{row}">{{row.shares===null?'—':row.shares}}</template>
           </el-table-column>
           <el-table-column label="来源" width="85">
-            <template #default="{row}">{{row.source==='manual'?'手工':'设备'}}</template>
+            <template #default="{row}">{{row.source==='manual'?'手工':row.source==='browser'?'浏览器':'手机'}}</template>
           </el-table-column>
           <el-table-column type="expand">
             <template #default="{row}">

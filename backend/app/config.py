@@ -37,6 +37,10 @@ class AppConfig(BaseSettings):
     text_api_key: SecretStr = SecretStr("")
     image_api_key: SecretStr = SecretStr("")
     speech_api_key: SecretStr = SecretStr("")
+    video_api_key: SecretStr = SecretStr("")
+    hypit_cli: Path = ROOT / ".tools/hypit/node_modules/.bin/hypit"
+    browser_use_python: Path = ROOT / ".tools/browser-use/.venv/bin/python"
+    chrome_path: Path = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     tikhub_api_key: SecretStr = SecretStr("")
 
     @property
@@ -44,7 +48,7 @@ class AppConfig(BaseSettings):
         return f"sqlite:///{self.data_dir.resolve() / 'publisher.sqlite3'}"
 
     def key(self, kind: str) -> str:
-        if kind not in {"text", "image", "speech"}:
+        if kind not in {"text", "image", "speech", "video"}:
             raise ValueError("Unknown model capability")
         return getattr(self, f"{kind}_api_key").get_secret_value()
 
@@ -61,27 +65,34 @@ class AppConfig(BaseSettings):
                 os.environ["PATH"] = parent + os.pathsep + os.environ.get("PATH", "")
 
 
-def default_settings(timezone: str) -> dict:
+def default_model_profile(kind: str) -> dict:
     return {
-        "models": {
-            kind: {
-                "base_url": "",
-                "model": "",
-                "timeout_seconds": 180 if kind != "text" else 90,
-                "voice": "alloy",
-                "size": "1024x1536",
-                "json_mode": False,
-                "enabled": False,
-                "protocol": "openai",
-                "language_type": "Chinese",
-                "max_completion_tokens": None,
-                "enable_thinking": None,
-                "watermark": False,
-                "instruction": "",
-            }
-            for kind in ("text", "image", "speech")
-        },
+        "base_url": "",
+        "model": "",
+        "timeout_seconds": 180 if kind != "text" else 90,
+        "voice": "alloy",
+        "size": "1024x1536",
+        "json_mode": False,
+        "enabled": False,
+        "protocol": "minimax_h3" if kind == "video" else "openai",
+        "language_type": "Chinese",
+        "max_completion_tokens": None,
+        "enable_thinking": None,
+        "watermark": False,
+        "instruction": "",
+    }
+
+
+def default_settings(timezone: str) -> dict:
+    # Stored records keep the legacy shape on purpose: db.settings resolves the additive
+    # source/local profile fields in memory, which keeps the voice_enabled->builtin mapping
+    # intact for every record that never saved an explicit source choice.
+    return {
+        "models": {kind: default_model_profile(kind) for kind in ("text", "image", "speech", "video")},
         "video": {
+            "renderer": "ffmpeg",
+            "clip_duration": 6,
+            "clip_resolution": "768P",
             "width": 1080,
             "height": 1920,
             "fps": 30,

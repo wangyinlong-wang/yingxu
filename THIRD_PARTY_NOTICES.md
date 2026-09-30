@@ -31,6 +31,8 @@
 
 ## 外部服务与独立项目
 
-OpenAI 兼容接口、火山方舟、百炼、TikHub、RSS 来源及目标发布平台分别适用其服务和内容条款。本项目没有附赠账号、额度、素材授权或平台合作资格；软件许可证不构成对这些服务的授权。
+browser-use 0.13.10 作为可选本地浏览器控制运行时，安装到 `.tools/browser-use/.venv`，使用其 MIT 许可证；本项目没有打包 Google Chrome。完整传递依赖版本见 [运行时锁文件](scripts/browser_use/requirements.lock)，许可证以各安装分发包为准。上游：[browser-use](https://github.com/browser-use/browser-use)、[许可证](https://github.com/browser-use/browser-use/blob/main/LICENSE)。
 
-V2 设计参考了 OpenMontage 等公开项目的架构思路；本仓库没有将其源码作为依赖引入。Hypit 当前仅经过适配可行性评估，尚未接入或分发；未来若引入，应单独核对其许可证并更新本文件。
+OpenAI 兼容接口、火山方舟、百炼、Metaso MiniMax H3、TikHub、RSS 来源及目标发布平台分别适用其服务和内容条款。本项目没有附赠账号、额度、素材授权或平台合作资格；软件许可证不构成对这些服务的授权。
+
+V2 设计参考了 OpenMontage 等公开项目的架构思路；本仓库没有将其源码作为依赖引入。Hypit 已作为独立可选本地渲染运行时接入，安装脚本下载固定版本 0.2.10；本仓库不分发其源码或二进制。Hypit 使用其自己的 source-available 许可，不属于本项目 MIT 授权范围；其许可证对内部使用、向第三方托管及商业分发规定了不同条件。使用与再分发须核对 [Hypit LICENSE](https://github.com/hypit-ai/hypit/blob/main/LICENSE)。HyperFrames、Chrome/Chromium 及其传递依赖同样适用各自条款。

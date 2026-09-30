@@ -1,4 +1,4 @@
-"""RSS, Atom, Hacker News and bounded public X timeline collection."""
+"""RSS, Atom, Hacker News, news listing pages and bounded X collection."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -31,11 +31,21 @@ _SUMMARY_LIMIT = 1_000
 _HN_API_HOST = "hacker-news.firebaseio.com"
 _X_TIMELINE_HOST = "syndication.twitter.com"
 _X_HANDLE = re.compile(r"[A-Za-z0-9_]{1,15}")
+_X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+_X_SEARCH_MAX = 500
+_KEYWORD_WEIGHT = 30
+_MAX_LISTING_BYTES = 5_000_000
+_LISTING_DATE = re.compile(
+    r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.? (\d{1,2}), (\d{4})\b"
+    r"|\b(\d{4})-(\d{2})-(\d{2})\b"
+)
+_MONTHS = {name: index for index, name in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 _TIKHUB_DATA_MISSING = object()
 _RELEVANCE_PATTERNS = (
     (
         re.compile(
-            r"\b(ai|llm|gpt|openai|anthropic|claude|gemini|qwen|deepseek)\b",
+            r"\b(ai|agi|llms?|gpt[\w.-]*|chatgpt|openai|anthropic|claude|gemini|qwen|deepseek|grok|xai"
+            r"|llama|mistral|codex|sora|copilot|perplexity|midjourney|kimi|moonshot|minimax|glm|zhipu)\b",
             re.IGNORECASE,
         ),
         28,
@@ -62,7 +72,8 @@ _RELEVANCE_PATTERNS = (
         "音视频技术",
     ),
     (
-        re.compile(r"人工智能|大模型|语言模型|机器学习|深度学习|推理|智能体|模型训练|开源模型|编程|开发者|数据库|算力"),
+        re.compile(r"人工智能|大模型|语言模型|机器学习|深度学习|推理|智能体|模型训练|开源模型|编程|开发者|数据库|算力"
+            r"|豆包|通义|文心|智谱|月之暗面|可灵|混元"),
         24,
         "中文技术内容",
     ),
@@ -129,10 +140,46 @@ def _published_iso(entry: Any) -> str | None:
     return None
 
 
-def _relevance(title: str, summary: str) -> tuple[float, str]:
+def source_keywords(value: Any) -> list[str]:
+    """Normalize user focus keywords: trimmed, de-duplicated case-insensitively, bounded."""
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        keyword = re.sub(r"\s+", " ", item).strip()[:50]
+        if keyword and keyword.casefold() not in seen:
+            seen.add(keyword.casefold())
+            result.append(keyword)
+        if len(result) >= 30:
+            break
+    return result
+
+
+def _keyword_hits(text: str, keywords: list[str]) -> list[str]:
+    hits = []
+    for keyword in keywords:
+        # ASCII words need boundaries ("ai" must not match "said"); CJK keywords match as substrings.
+        if re.fullmatch(r"[\w .+-]+", keyword, re.ASCII):
+            pattern = r"(?<![A-Za-z0-9])" + re.escape(keyword) + r"(?![A-Za-z0-9])"
+            matched = re.search(pattern, text, re.IGNORECASE)
+        else:
+            matched = keyword.casefold() in text.casefold()
+        if matched:
+            hits.append(keyword)
+    return hits
+
+
+def _relevance(title: str, summary: str, keywords: list[str] | None = None) -> tuple[float, str]:
     combined = f"{title} {summary}"
     score = 0
     reasons: list[str] = []
+    hits = _keyword_hits(combined, keywords or [])
+    if hits:
+        score += _KEYWORD_WEIGHT
+        reasons.append("关注词 " + "/".join(hits[:3]))
     for pattern, weight, label in _RELEVANCE_PATTERNS:
         if pattern.search(combined):
             score += weight
@@ -149,10 +196,36 @@ def _numeric_score(value: Any) -> float:
         return 0.0
 
 
-def _collect_rss(url: str, limit: int) -> list[dict]:
+# Case-sensitive on purpose: "rust-v0.160.0" is a bare tag, "GPT-6.1" is a product name.
+_VERSION_TITLE = re.compile(r"(?:[Rr]elease\s+|[Vv]ersion\s+|[a-z]{2,12}-)?[vV]?\d+(?:\.\d+)+(?:[-+.][0-9A-Za-z]+)*")
+_RELEASE_SUFFIX = re.compile(r"\s*(?:releases?|release notes|changelog|更新日志|版本发布)\s*$", re.IGNORECASE)
+
+
+def release_label(source_name: str | None, link: str) -> str:
+    """Product name for version-only release titles: the source name, else the GitHub owner/repo."""
+    label = _RELEASE_SUFFIX.sub("", source_name or "").strip()
+    if label:
+        return label[:100]
+    parsed = urlsplit(link)
+    parts = [part for part in parsed.path.split("/") if part]
+    if (parsed.hostname or "").lower() == "github.com" and len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return ""
+
+
+def contextual_title(title: str, label: str) -> str:
+    """A bare "0.159.1" says nothing in a topic list; name the product it belongs to."""
+    if label and _VERSION_TITLE.fullmatch(title) and not title.casefold().startswith(label.casefold()):
+        return f"{label} {title}"[:300]
+    return title
+
+
+def _collect_rss(
+    url: str, limit: int, keywords: list[str] | None = None, source_name: str | None = None
+) -> list[dict]:
     if feedparser is None:
         raise IntegrationError("DEPENDENCY_MISSING", "未安装 RSS 解析组件")
-    body, _content_type, final_url = safe_get(url, max_bytes=_MAX_FEED_BYTES)
+    body, _content_type, final_url = safe_get(url, max_bytes=_MAX_FEED_BYTES, retries=2)
     if not body.strip():
         return []
     parsed = feedparser.parse(body)
@@ -167,8 +240,9 @@ def _collect_rss(url: str, limit: int) -> list[dict]:
         if not title or not link or link in seen:
             continue
         seen.add(link)
+        title = contextual_title(title, release_label(source_name, link))
         summary = _plain_text(entry.get("summary") or entry.get("description") or entry.get("content"))
-        relevance_score, reason = _relevance(title, summary)
+        relevance_score, reason = _relevance(title, summary, keywords)
         results.append(
             {
                 "title": title,
@@ -185,8 +259,8 @@ def _collect_rss(url: str, limit: int) -> list[dict]:
     return results
 
 
-def _load_json(url: str, *, max_bytes: int, timeout: float = 20) -> tuple[Any, str]:
-    body, _content_type, final_url = safe_get(url, max_bytes=max_bytes, timeout=timeout)
+def _load_json(url: str, *, max_bytes: int, timeout: float = 20, retries: int = 0) -> tuple[Any, str]:
+    body, _content_type, final_url = safe_get(url, max_bytes=max_bytes, timeout=timeout, retries=retries)
     try:
         return json.loads(body.decode("utf-8")), final_url
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -208,9 +282,9 @@ def _hn_index_url(source_url: str) -> str:
     return f"https://{_HN_API_HOST}/v0/topstories.json"
 
 
-def _collect_hackernews(url: str, limit: int) -> dict:
+def _collect_hackernews(url: str, limit: int, keywords: list[str] | None = None) -> dict:
     deadline = time.monotonic() + _HN_COLLECTION_TIMEOUT
-    identifiers, _ = _load_json(_hn_index_url(url), max_bytes=500_000, timeout=10)
+    identifiers, _ = _load_json(_hn_index_url(url), max_bytes=500_000, timeout=10, retries=2)
     if not isinstance(identifiers, list):
         raise IntegrationError("INVALID_SOURCE_RESPONSE", "Hacker News 索引响应无效")
     candidate_ids = [value for value in identifiers if isinstance(value, int) and value > 0]
@@ -251,7 +325,7 @@ def _collect_hackernews(url: str, limit: int) -> dict:
             summary = _plain_text(item.get("text"))
             if not title:
                 continue
-            relevance_score, reason = _relevance(title, summary)
+            relevance_score, reason = _relevance(title, summary, keywords)
             if relevance_score <= 0:
                 continue
             link = _normalize_url(item.get("url"), base_url="https://news.ycombinator.com/")
@@ -308,7 +382,7 @@ def x_profile_handle(url: str) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or port is not None
-        or host not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+        or host not in _X_HOSTS
         or parsed.query
         or parsed.fragment
         or len(parts) != 1
@@ -317,6 +391,37 @@ def x_profile_handle(url: str) -> str:
     ):
         raise IntegrationError("INVALID_X_SOURCE", "X 来源必须是公开账号主页地址")
     return parts[0]
+
+
+def x_search_query(url: str) -> tuple[str, str]:
+    """Return (query, TikHub search_type) from a canonical https://x.com/search?q=…&f=live|top URL."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        params = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=bool(parsed.query))
+    except ValueError as exc:
+        raise IntegrationError("INVALID_X_SEARCH", "X 搜索来源地址无效") from exc
+    host = (parsed.hostname or "").lower().rstrip(".")
+    queries = params.get("q", [])
+    modes = params.get("f", ["live"])
+    query = re.sub(r"\s+", " ", queries[0]).strip() if len(queries) == 1 else ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or host not in _X_HOSTS
+        or parsed.path.rstrip("/") != "/search"
+        or parsed.fragment
+        or set(params) - {"q", "f"}
+        or not query
+        or len(query) > _X_SEARCH_MAX
+        or any(ord(character) < 32 for character in query)
+        or len(modes) != 1
+        or modes[0] not in {"live", "top"}
+    ):
+        raise IntegrationError("INVALID_X_SEARCH", "X 搜索来源必须是 https://x.com/search?q=关键词 形式")
+    return query, "Latest" if modes[0] == "live" else "Top"
 
 
 def _x_plain_text(value: Any, *, limit: int = 12_000) -> str:
@@ -378,6 +483,8 @@ def _filter_x_tweets(
     instant: datetime | None,
     scanned: int,
     warning: str,
+    keywords: list[str] | None = None,
+    fallback: tuple[float, str] | None = None,
 ) -> dict:
     observed_at = (instant or datetime.now(UTC)).astimezone(UTC)
     cutoff = observed_at - timedelta(days=30)
@@ -406,9 +513,13 @@ def _filter_x_tweets(
             continue
         supplements = _x_supplement(tweet)
         summary = _x_plain_text("\n\n".join([text, *supplements]))
-        relevance_score, reason = _relevance(text, " ".join(supplements))
+        relevance_score, reason = _relevance(text, " ".join(supplements), keywords)
         if relevance_score <= 0:
-            continue
+            # X search already matched the user's query beyond the visible text (quotes, cards,
+            # media); a literal text filter would drop most legitimate results.
+            if fallback is None:
+                continue
+            relevance_score, reason = fallback
         seen.add(identifier)
         candidates.append(
             (
@@ -434,7 +545,9 @@ def _filter_x_tweets(
     }
 
 
-def _collect_x(url: str, limit: int, *, instant: datetime | None = None) -> dict:
+def _collect_x(
+    url: str, limit: int, *, instant: datetime | None = None, keywords: list[str] | None = None
+) -> dict:
     handle = x_profile_handle(url)
     endpoint = f"https://{_X_TIMELINE_HOST}/srv/timeline-profile/screen-name/{handle}"
     body, _content_type, final_url = safe_get(
@@ -469,7 +582,7 @@ def _collect_x(url: str, limit: int, *, instant: datetime | None = None) -> dict
         f"X 公开时间线仅提供当前可见的有限窗口（本轮 {scanned} 条），"
         "不代表完整 X 搜索或完整 30 天历史"
     )
-    return _filter_x_tweets(tweets, limit, instant=instant, scanned=scanned, warning=warning)
+    return _filter_x_tweets(tweets, limit, instant=instant, scanned=scanned, warning=warning, keywords=keywords)
 
 
 def _tikhub_result(value: Any) -> dict | None:
@@ -479,9 +592,42 @@ def _tikhub_result(value: Any) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
+def _normalize_flat_tikhub_tweet(node: dict, *, nested: bool) -> dict | None:
+    """TikHub's current flattened shape: tweet_id/text/favorites plus author or screen_name."""
+    identifier = node.get("tweet_id")
+    if isinstance(identifier, int) and not isinstance(identifier, bool):
+        identifier = str(identifier)
+    author = node.get("author") if isinstance(node.get("author"), dict) else node.get("user_info")
+    screen_name = author.get("screen_name") if isinstance(author, dict) else None
+    if screen_name is None:
+        screen_name = node.get("screen_name")
+    result = {
+        "id_str": identifier,
+        "full_text": node.get("text"),
+        "created_at": node.get("created_at"),
+        "favorite_count": node.get("favorites"),
+        "user": {"screen_name": screen_name} if screen_name is not None else {},
+    }
+    if not nested:
+        retweeted = node.get("retweeted_tweet") or node.get("retweeted_status")
+        if isinstance(retweeted, dict):
+            retweet = _normalize_tikhub_tweet(retweeted, nested=True)
+            if retweet is None:
+                return None
+            result["retweeted_status"] = retweet
+        quoted = node.get("quoted")
+        if isinstance(quoted, dict):
+            quote = _normalize_tikhub_tweet(quoted, nested=True)
+            if quote is not None:
+                result["quoted_status"] = quote
+    return result if _x_post_identity(result) and _x_tweet_text(result) else None
+
+
 def _normalize_tikhub_tweet(value: Any, *, nested: bool = False) -> dict | None:
     if not isinstance(value, dict):
         return None
+    if "tweet_id" in value and "legacy" not in value:
+        return _normalize_flat_tikhub_tweet(value, nested=nested)
     wrapped = value.get("tweet")
     node = wrapped if isinstance(wrapped, dict) else value
     legacy = node.get("legacy") if isinstance(node.get("legacy"), dict) else node
@@ -546,6 +692,10 @@ def _tikhub_tweet_nodes(data: Any) -> tuple[list[Any], bool]:
         if key in data:
             values = data[key]
             return (values[:200], True) if isinstance(values, list) else ([], False)
+    if isinstance(data.get("timeline"), list):
+        # Current flattened user-posts and search pages; a pinned post is still bounded by age below.
+        pinned = [data["pinned"]] if isinstance(data.get("pinned"), dict) else []
+        return (pinned + data["timeline"])[:200], True
     user = data.get("user")
     result = user.get("result") if isinstance(user, dict) else None
     timeline_v2 = result.get("timeline_v2") if isinstance(result, dict) else None
@@ -578,24 +728,130 @@ def _tikhub_tweet_nodes(data: Any) -> tuple[list[Any], bool]:
     return nodes, not invalid_non_cursor
 
 
-def _collect_x_tikhub(data: Any, limit: int, *, instant: datetime | None = None) -> dict:
+def _collect_x_tikhub(
+    data: Any,
+    limit: int,
+    *,
+    instant: datetime | None = None,
+    keywords: list[str] | None = None,
+    search_query: str | None = None,
+) -> dict:
     nodes, valid_shape = _tikhub_tweet_nodes(data)
     if not valid_shape:
         raise IntegrationError("TIKHUB_RESPONSE_INVALID", "TikHub X 数据结构无效，已保留原始结果供本地重试")
     tweets = [tweet for node in nodes if (tweet := _normalize_tikhub_tweet(node)) is not None]
     if nodes and not tweets:
         raise IntegrationError("TIKHUB_RESPONSE_INVALID", "TikHub 当前页没有可识别的推文结构")
-    warning = (
-        f"TikHub 仅返回当前一页（本轮识别 {len(tweets)} 条），"
-        "不代表完整 X 搜索或完整 30 天历史"
-    )
+    if search_query is None:
+        warning = (
+            f"TikHub 仅返回当前一页（本轮识别 {len(tweets)} 条），"
+            "不代表完整 X 搜索或完整 30 天历史"
+        )
+        fallback = None
+    else:
+        warning = f"TikHub 搜索仅返回当前一页（本轮识别 {len(tweets)} 条），不代表完整搜索结果"
+        fallback = (45.0, "匹配 X 搜索条件")
     return _filter_x_tweets(
         tweets,
         limit,
         instant=instant,
         scanned=len(nodes),
         warning=warning,
+        keywords=keywords,
+        fallback=fallback,
     )
+
+
+def _listing_date(value: str) -> str | None:
+    match = _LISTING_DATE.search(value or "")
+    if not match:
+        return None
+    try:
+        if match.group(1):
+            month = _MONTHS[match.group(1)[:3].lower()]
+            stamp = datetime(int(match.group(3)), month, int(match.group(2)), tzinfo=UTC)
+        else:
+            stamp = datetime(int(match.group(4)), int(match.group(5)), int(match.group(6)), tzinfo=UTC)
+    except (KeyError, ValueError):
+        return None
+    return stamp.isoformat()
+
+
+def _listing_prefix(options: dict, final_url: str) -> str:
+    prefix = options.get("path_prefix") if isinstance(options, dict) else None
+    if prefix is None:
+        return urlsplit(final_url).path.rstrip("/") + "/"
+    if not isinstance(prefix, str) or not prefix.startswith("/") or len(prefix) > 200 or "//" in prefix:
+        raise IntegrationError("INVALID_SOURCE", "网页列表的文章路径前缀必须以 / 开头")
+    return prefix
+
+
+def _collect_html_list(url: str, limit: int, options: dict, keywords: list[str] | None = None) -> dict:
+    """Read one public news listing page; only same-host article links under the listing path are kept."""
+    body, content_type, final_url = safe_get(url, max_bytes=_MAX_LISTING_BYTES, timeout=30, retries=2)
+    if "html" not in content_type and not body.lstrip().startswith((b"<!DOCTYPE", b"<!doctype", b"<html")):
+        raise IntegrationError("INVALID_LISTING", "来源返回的内容不是网页，无法解析文章列表")
+    prefix = _listing_prefix(options, final_url)
+    host = (urlsplit(final_url).hostname or "").lower()
+    document = BeautifulSoup(body, "html.parser")
+    for element in document.select("script,style,noscript,svg,template"):
+        element.decompose()
+    found: dict[str, dict] = {}
+    anchors = document.find_all("a", href=True)
+    for anchor in anchors[:2_000]:
+        link = _normalize_url(anchor["href"], base_url=final_url)
+        if not link:
+            continue
+        parsed = urlsplit(link)
+        path = parsed.path.rstrip("/")
+        if (parsed.hostname or "").lower() != host or not path.startswith(prefix.rstrip("/") + "/"):
+            continue
+        if path == prefix.rstrip("/") or parsed.query:
+            continue
+        time_tag = anchor.find("time")
+        if time_tag is None and anchor.parent is not None:
+            # A parent's date belongs to this link only when that parent holds a single date.
+            sibling_times = anchor.parent.find_all("time", limit=2)
+            time_tag = sibling_times[0] if len(sibling_times) == 1 else None
+        published = None
+        if time_tag is not None:
+            published = _published_iso({"published": time_tag.get("datetime")}) if time_tag.get("datetime") else None
+            published = published or _listing_date(time_tag.get_text(" ", strip=True))
+            if time_tag in anchor.descendants:
+                time_tag.extract()
+        published = published or _listing_date(anchor.get_text(" ", strip=True))
+        heading = anchor.find(re.compile(r"^h[1-6]$"))
+        candidates = [heading.get_text(" ", strip=True)] if heading else list(anchor.stripped_strings)
+        title = _plain_text(max(candidates, key=len, default=""), limit=300)
+        key = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+        current = found.get(key)
+        if current is None:
+            found[key] = {"url": link, "title": title, "published_at": published}
+        else:
+            if len(title) > len(current["title"]):
+                current["title"] = title
+            current["published_at"] = current["published_at"] or published
+    items = []
+    for entry in found.values():
+        if len(entry["title"]) < 6:
+            continue
+        relevance_score, reason = _relevance(entry["title"], "", keywords)
+        items.append(
+            {
+                "title": entry["title"],
+                "url": entry["url"],
+                "summary": "",
+                "published_at": entry["published_at"],
+                "score": 0.0,
+                "relevance_score": relevance_score,
+                "selection_reason": reason if relevance_score else "来自已配置的网页列表",
+            }
+        )
+        if len(items) >= limit:
+            break
+    if not items and anchors:
+        raise IntegrationError("LISTING_EMPTY", f"网页中没有找到 {prefix} 下的文章链接，请检查地址或路径前缀")
+    return {"items": items, "complete": True, "scanned": len(found), "candidates": len(found), "warning": ""}
 
 
 def fetch_article_excerpt(url: str) -> dict:
@@ -632,10 +888,11 @@ def collect_source(source: dict, *, limit: int = 30, tikhub_data: Any = _TIKHUB_
         raise IntegrationError("INVALID_LIMIT", "单次采集数量必须在 1 到 100 之间")
     kind = str(source.get("kind") or "").strip().lower()
     url = str(source.get("url") or "").strip()
+    keywords = source_keywords(source.get("keywords"))
     if not url:
         raise IntegrationError("INVALID_SOURCE", "请填写来源地址")
     if kind == "rss":
-        items = _collect_rss(url, limit)
+        items = _collect_rss(url, limit, keywords, str(source.get("name") or ""))
         return {
             "items": items,
             "complete": True,
@@ -644,11 +901,14 @@ def collect_source(source: dict, *, limit: int = 30, tikhub_data: Any = _TIKHUB_
             "warning": "",
         }
     if kind == "hackernews":
-        return _collect_hackernews(url, limit)
+        return _collect_hackernews(url, limit, keywords)
     if kind == "x":
-        return _collect_x(url, limit)
-    if kind == "x_tikhub":
+        return _collect_x(url, limit, keywords=keywords)
+    if kind == "html_list":
+        return _collect_html_list(url, limit, source.get("options") or {}, keywords)
+    if kind in {"x_tikhub", "x_tikhub_search"}:
         if tikhub_data is _TIKHUB_DATA_MISSING:
             raise IntegrationError("TIKHUB_RESPONSE_MISSING", "TikHub X 采集缺少已持久化的数据响应")
-        return _collect_x_tikhub(tikhub_data, limit)
+        query = x_search_query(url)[0] if kind == "x_tikhub_search" else None
+        return _collect_x_tikhub(tikhub_data, limit, keywords=keywords, search_query=query)
     raise IntegrationError("UNSUPPORTED_SOURCE", "暂不支持该来源类型")

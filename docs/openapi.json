@@ -119,6 +119,59 @@
         }
       }
     },
+    "/api/v1/source-presets": {
+      "get": {
+        "summary": "Source Presets",
+        "operationId": "source_presets_api_v1_source_presets_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/source-presets/apply": {
+      "post": {
+        "summary": "Apply Source Presets",
+        "description": "Add chosen recommended sources; existing URLs are never duplicated or overwritten.",
+        "operationId": "apply_source_presets_api_v1_source_presets_apply_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourcePresetApply"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/{identifier}": {
       "patch": {
         "summary": "Update Source",
@@ -263,8 +316,76 @@
               "default": 100,
               "title": "Limit"
             }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "heat",
+                "relevance"
+              ],
+              "type": "string",
+              "default": "heat",
+              "title": "Sort"
+            }
+          },
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 30,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Days"
+            }
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/topics/import": {
+      "post": {
+        "summary": "Import Topic",
+        "operationId": "import_topic_api_v1_topics_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TopicImport"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1396,6 +1517,229 @@
         }
       }
     },
+    "/api/v1/devices/wireless-pair": {
+      "post": {
+        "summary": "Pair Wireless Device",
+        "operationId": "pair_wireless_device_api_v1_devices_wireless_pair_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WirelessPairInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/devices/wireless-connect": {
+      "post": {
+        "summary": "Connect Wireless Device",
+        "operationId": "connect_wireless_device_api_v1_devices_wireless_connect_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WirelessConnectInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/devices/wireless-qr": {
+      "post": {
+        "summary": "Start Wireless Qr",
+        "operationId": "start_wireless_qr_api_v1_devices_wireless_qr_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/devices/wireless-qr/{token}/poll": {
+      "post": {
+        "summary": "Poll Wireless Qr",
+        "operationId": "poll_wireless_qr_api_v1_devices_wireless_qr__token__poll_post",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/browser/status": {
+      "get": {
+        "summary": "Browser Status",
+        "operationId": "browser_status_api_v1_browser_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/browser/{platform}/open": {
+      "post": {
+        "summary": "Open Browser",
+        "operationId": "open_browser_api_v1_browser__platform__open_post",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "douyin",
+                "xiaohongshu"
+              ],
+              "type": "string",
+              "title": "Platform"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/browser/{platform}/inspect": {
+      "post": {
+        "summary": "Inspect Browser",
+        "operationId": "inspect_browser_api_v1_browser__platform__inspect_post",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "douyin",
+                "xiaohongshu"
+              ],
+              "type": "string",
+              "title": "Platform"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/devices/{serial}/inspect": {
       "post": {
         "summary": "Inspect Device Route",
@@ -1665,6 +2009,52 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/PublicationCancel"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/publications/{identifier}/finish-declaration": {
+      "post": {
+        "summary": "Finish Declaration",
+        "operationId": "finish_declaration_api_v1_publications__identifier__finish_declaration_post",
+        "parameters": [
+          {
+            "name": "identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Identifier"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_finish_declaration_api_v1_publications__identifier__finish_declaration_post"
               }
             }
           }
@@ -2466,6 +2856,106 @@
         }
       }
     },
+    "/api/v1/settings/model-keys/{kind}": {
+      "post": {
+        "summary": "Manage Model Key",
+        "description": "Store or clear one URL-scoped model API key in the macOS Keychain; returns metadata only.",
+        "operationId": "manage_model_key_api_v1_settings_model_keys__kind__post",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Kind"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelKeyAction"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings/tikhub-key": {
+      "get": {
+        "summary": "Get Tikhub Key Status",
+        "description": "Whether a TikHub key is configured and where it comes from; never the key itself.",
+        "operationId": "get_tikhub_key_status_api_v1_settings_tikhub_key_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Manage Tikhub Key",
+        "description": "Store or clear the TikHub API key in the macOS Keychain; returns metadata only.",
+        "operationId": "manage_tikhub_key_api_v1_settings_tikhub_key_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TikhubKeyAction"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/schedules": {
       "get": {
         "summary": "Schedules",
@@ -2590,12 +3080,21 @@
             "minLength": 1,
             "title": "Account Identifier"
           },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "android",
+              "browser"
+            ],
+            "title": "Channel",
+            "default": "android"
+          },
           "device_serial": {
             "type": "string",
             "maxLength": 200,
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9._:-]+$",
-            "title": "Device Serial"
+            "pattern": "^[A-Za-z0-9._:-]*$",
+            "title": "Device Serial",
+            "default": ""
           }
         },
         "additionalProperties": false,
@@ -2603,8 +3102,7 @@
         "required": [
           "platform",
           "display_name",
-          "account_identifier",
-          "device_serial"
+          "account_identifier"
         ],
         "title": "AccountInput"
       },
@@ -2814,6 +3312,17 @@
         "additionalProperties": false,
         "type": "object",
         "title": "BenchmarkPatch"
+      },
+      "Body_finish_declaration_api_v1_publications__identifier__finish_declaration_post": {
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "Body_finish_declaration_api_v1_publications__identifier__finish_declaration_post"
       },
       "Body_upload_asset_api_v1_assets_post": {
         "properties": {
@@ -3543,8 +4052,10 @@
               "assets",
               "render",
               "local_voice",
+              "local_avatar_all",
               "motion",
-              "images"
+              "images",
+              "video"
             ],
             "title": "Stage",
             "default": "all"
@@ -3561,6 +4072,75 @@
               }
             ],
             "title": "Scene Id"
+          },
+          "clip_duration": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 15.0,
+                "minimum": 4.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Clip Duration"
+          },
+          "clip_resolution": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "768P",
+                  "2K"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Clip Resolution"
+          },
+          "reference_image_asset_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 36,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Image Asset Id"
+          },
+          "reference_audio_asset_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 36,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Audio Asset Id"
+          },
+          "avatar_layout": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "corner",
+                  "fullscreen"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Layout"
           }
         },
         "additionalProperties": false,
@@ -3757,6 +4337,54 @@
           "publication_id"
         ],
         "title": "MetricInput"
+      },
+      "ModelKeyAction": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "third_party",
+              "local"
+            ],
+            "title": "Source"
+          },
+          "base_url": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Base Url"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "set",
+              "clear"
+            ],
+            "title": "Action"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "password",
+                "writeOnly": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source",
+          "base_url",
+          "action"
+        ],
+        "title": "ModelKeyAction",
+        "description": "Dedicated credential endpoint body; API keys never travel inside PATCH /settings."
       },
       "Platforms": {
         "properties": {
@@ -4007,6 +4635,17 @@
             ],
             "title": "Image Asset Id"
           },
+          "video_asset_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Video Asset Id"
+          },
           "audio_asset_ids": {
             "items": {
               "type": "string"
@@ -4087,7 +4726,8 @@
             "type": "string",
             "enum": [
               "pipeline",
-              "metrics"
+              "metrics",
+              "collect"
             ],
             "title": "Kind"
           },
@@ -4111,6 +4751,24 @@
             "minimum": 1.0,
             "title": "Daily Limit",
             "default": 1
+          },
+          "interval_minutes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1440.0,
+                "minimum": 30.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Minutes"
+          },
+          "include_paid": {
+            "type": "boolean",
+            "title": "Include Paid",
+            "default": false
           }
         },
         "additionalProperties": false,
@@ -4163,7 +4821,9 @@
                   "rss",
                   "hackernews",
                   "x",
-                  "x_tikhub"
+                  "x_tikhub",
+                  "x_tikhub_search",
+                  "html_list"
                 ]
               },
               {
@@ -4191,7 +4851,9 @@
               "rss",
               "hackernews",
               "x",
-              "x_tikhub"
+              "x_tikhub",
+              "x_tikhub_search",
+              "html_list"
             ],
             "title": "Kind",
             "default": "rss"
@@ -4205,6 +4867,17 @@
             "type": "boolean",
             "title": "Enabled",
             "default": true
+          },
+          "keywords": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 60,
+            "title": "Keywords"
+          },
+          "options": {
+            "$ref": "#/components/schemas/SourceOptions"
           }
         },
         "additionalProperties": false,
@@ -4214,6 +4887,26 @@
           "url"
         ],
         "title": "SourceCreate"
+      },
+      "SourceOptions": {
+        "properties": {
+          "path_prefix": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200,
+                "pattern": "^/[^\\s?#]*$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path Prefix"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SourceOptions"
       },
       "SourcePatch": {
         "properties": {
@@ -4267,11 +4960,55 @@
               }
             ],
             "title": "Enabled"
+          },
+          "keywords": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 60
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Keywords"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
         "type": "object",
         "title": "SourcePatch"
+      },
+      "SourcePresetApply": {
+        "properties": {
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ids"
+        ],
+        "title": "SourcePresetApply"
       },
       "TemplateInput": {
         "properties": {
@@ -4310,6 +5047,75 @@
           "prompt"
         ],
         "title": "TemplateInput"
+      },
+      "TikhubKeyAction": {
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "set",
+              "clear"
+            ],
+            "title": "Action"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "password",
+                "writeOnly": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "title": "TikhubKeyAction",
+        "description": "Dedicated TikHub credential body; the key is stored in the Keychain and never echoed."
+      },
+      "TopicImport": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 36,
+            "minLength": 1,
+            "title": "Source Id"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "url": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Url"
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 12000,
+            "minLength": 1,
+            "title": "Summary"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_id",
+          "title",
+          "url",
+          "summary"
+        ],
+        "title": "TopicImport"
       },
       "ValidationError": {
         "properties": {
@@ -4350,6 +5156,72 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WirelessConnectInput": {
+        "properties": {
+          "ip": {
+            "type": "string",
+            "maxLength": 15,
+            "minLength": 7,
+            "title": "Ip"
+          },
+          "connection_port": {
+            "type": "integer",
+            "maximum": 65535.0,
+            "minimum": 1.0,
+            "title": "Connection Port"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ip",
+          "connection_port"
+        ],
+        "title": "WirelessConnectInput"
+      },
+      "WirelessPairInput": {
+        "properties": {
+          "ip": {
+            "type": "string",
+            "maxLength": 15,
+            "minLength": 7,
+            "title": "Ip"
+          },
+          "pairing_port": {
+            "type": "integer",
+            "maximum": 65535.0,
+            "minimum": 1.0,
+            "title": "Pairing Port"
+          },
+          "connection_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Port"
+          },
+          "pairing_code": {
+            "type": "string",
+            "format": "password",
+            "title": "Pairing Code",
+            "writeOnly": true
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ip",
+          "pairing_port",
+          "pairing_code"
+        ],
+        "title": "WirelessPairInput"
       },
       "XiaohongshuPlatformText": {
         "properties": {

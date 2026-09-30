@@ -20,6 +20,7 @@ from app.integrations.errors import CanceledError, IntegrationError
 from app.integrations.local_ai import local_status, run_local
 from app.models import Asset, Content, Job, JobStep, ModelCall, Setting, uid
 from app.services import enqueue
+from app.storage import register_file
 from app.worker import Worker, recover_expired
 from app.workflow import TaskContext
 
@@ -906,6 +907,230 @@ def test_explicit_local_voice_replaces_existing_audio_without_cloud_calls(
     assert compose_calls == [True]
     with Session(engine) as session:
         assert session.scalar(select(func.count(ModelCall.id))) == 0
+
+
+def test_personal_voice_and_avatar_full_generation_forces_both_local_capabilities(
+    client, engine, config, content_id, monkeypatch
+):
+    monkeypatch.setattr("app.integrations.local_ai.local_status", lambda _config: _status("rev-persona"))
+    monkeypatch.setattr(
+        "app.api.shutil.which",
+        lambda name: f"/fixture/{name}" if name in {"ffmpeg", "ffprobe"} else None,
+    )
+    reference_path = config.data_dir / "runs" / "persona-reference.wav"
+    old_audio_path = config.data_dir / "runs" / "persona-old-audio.wav"
+    _write_wav(reference_path)
+    _write_wav(old_audio_path, 1)
+    with Session(engine) as session:
+        content = session.get(Content, content_id)
+        image = _asset(session, config, "image", ".png", b"persona-image", content_id=content.id)
+        old_audio = _asset(
+            session,
+            config,
+            "audio",
+            ".wav",
+            old_audio_path.read_bytes(),
+            content_id=content.id,
+        )
+        reference = _asset(
+            session,
+            config,
+            "voice_reference",
+            ".wav",
+            reference_path.read_bytes(),
+        )
+        portrait = _asset(session, config, "portrait", ".png", b"persona-portrait")
+        content.scenes = [
+            {
+                "id": "scene-persona",
+                "order": 0,
+                "narration": "使用本人声音和数字人形象。",
+                "caption": "本人数字人",
+                "highlight_terms": [],
+                "image_prompt": "fixture",
+                "image_asset_id": image.id,
+                "audio_asset_ids": [old_audio.id],
+            }
+        ]
+        setting = session.get(Setting, "app")
+        values = copy.deepcopy(setting.value)
+        values["local_ai"] = {
+            "voice_enabled": False,
+            "avatar_enabled": False,
+            "reference_audio_asset_id": reference.id,
+            "reference_text": "本人参考录音文字",
+            "portrait_asset_id": portrait.id,
+        }
+        setting.value = values
+        reference_id, portrait_id = reference.id, portrait.id
+        session.commit()
+
+    submitted = client.post(
+        f"/api/v1/contents/{content_id}/generate",
+        json={"stage": "local_avatar_all"},
+    )
+    assert submitted.status_code == 202, submitted.text
+    with Session(engine) as session:
+        job = session.get(Job, submitted.json()["job_id"])
+        profile = job.payload["local_ai"]
+        assert profile["voice_enabled"] is True
+        assert profile["avatar_enabled"] is True
+        assert profile["reference_audio"]["asset_id"] == reference_id
+        assert profile["portrait"]["asset_id"] == portrait_id
+        content = session.get(Content, content_id)
+        assert content.version == 2
+        assert content.scenes[0]["audio_asset_ids"] == []
+
+    calls = []
+    monkeypatch.setattr(
+        "app.workflow.plan_script", lambda _ctx: pytest.fail("existing script must be reused")
+    )
+    monkeypatch.setattr("app.workflow.generate_assets", lambda _ctx: calls.append("assets"))
+    monkeypatch.setattr("app.workflow.render", lambda _ctx: calls.append("render"))
+    assert Worker(config, engine=engine).run_once()
+    assert calls == ["assets", "render"]
+
+    with Session(engine) as session:
+        content = session.get(Content, content_id)
+        content.scenes = []
+        setting = session.get(Setting, "app")
+        values = copy.deepcopy(setting.value)
+        for kind in ("text", "image"):
+            values["models"][kind].update(
+                enabled=True,
+                base_url="https://fixture.example/v1",
+                model=f"fixture-{kind}",
+            )
+        setting.value = values
+        session.commit()
+
+    submitted_from_blank = client.post(
+        f"/api/v1/contents/{content_id}/generate",
+        json={"stage": "local_avatar_all"},
+    )
+    assert submitted_from_blank.status_code == 202, submitted_from_blank.text
+    with Session(engine) as session:
+        content = session.get(Content, content_id)
+        job = session.get(Job, submitted_from_blank.json()["job_id"])
+        assert content.version == 2
+        assert job.payload["version"] == 2
+        assert session.get(Setting, "app").value["models"]["speech"]["enabled"] is False
+
+    calls.clear()
+    monkeypatch.setattr("app.workflow.plan_script", lambda _ctx: calls.append("script"))
+    assert Worker(config, engine=engine).run_once()
+    assert calls == ["script", "assets", "render"]
+
+
+def test_fullscreen_personal_avatar_uses_h3_native_audio_without_musetalk(
+    client, engine, config, content_id, monkeypatch
+):
+    status = _status("rev-fullscreen")
+    status["avatar"]["installed"] = False
+    monkeypatch.setattr("app.integrations.local_ai.local_status", lambda _config: status)
+    monkeypatch.setattr(
+        "app.api.shutil.which",
+        lambda name: f"/fixture/{name}" if name in {"ffmpeg", "ffprobe"} else None,
+    )
+    reference_path = config.data_dir / "runs" / "fullscreen-reference.wav"
+    _write_wav(reference_path)
+    with Session(engine) as session:
+        content = session.get(Content, content_id)
+        reference = _asset(
+            session, config, "voice_reference", ".wav", reference_path.read_bytes()
+        )
+        portrait = _asset(session, config, "portrait", ".png", b"fullscreen-portrait")
+        content.scenes = [
+            {
+                "id": "scene-fullscreen",
+                "order": 0,
+                "narration": "Codex CLI 更新。",
+                "caption": "全屏数字人",
+                "highlight_terms": [],
+                "image_prompt": "Presenter explains the Codex CLI update",
+                "image_asset_id": None,
+                "audio_asset_ids": [],
+                "scene_type": "image",
+            }
+        ]
+        setting = session.get(Setting, "app")
+        values = copy.deepcopy(setting.value)
+        values["local_ai"] = {
+            "voice_enabled": False,
+            "avatar_enabled": False,
+            "reference_audio_asset_id": reference.id,
+            "reference_text": "Codex CLI 更新。",
+            "portrait_asset_id": portrait.id,
+        }
+        values["models"]["video"].update(
+            enabled=True,
+            base_url="https://video.example.test/api/minimax",
+            model="MiniMax-H3",
+        )
+        setting.value = values
+        portrait_id, portrait_sha = portrait.id, portrait.sha256
+        session.commit()
+
+    endpoint = f"/api/v1/contents/{content_id}/generate"
+    missing_confirmation = client.post(
+        endpoint,
+        json={"stage": "local_avatar_all", "avatar_layout": "fullscreen"},
+    )
+    assert missing_confirmation.status_code == 422
+    submitted = client.post(
+        endpoint,
+        json={
+            "stage": "local_avatar_all",
+            "avatar_layout": "fullscreen",
+            "clip_duration": 6,
+            "clip_resolution": "768P",
+        },
+    )
+    assert submitted.status_code == 202, submitted.text
+    with Session(engine) as session:
+        job = session.get(Job, submitted.json()["job_id"])
+        assert job.payload["avatar_layout"] == "fullscreen"
+        assert job.payload["local_ai"]["voice_enabled"] is True
+        assert job.payload["local_ai"]["avatar_enabled"] is False
+        assert job.payload["video_references"]["image"]["asset_id"] == portrait_id
+
+    observed = []
+
+    def invoke_video(engine_arg, config_arg, **kwargs):
+        observed.append(kwargs["payload"])
+        with Session(engine_arg) as session:
+            output = config_arg.data_dir / "runs" / "fullscreen-output.mp4"
+            output.write_bytes(b"fixture-fullscreen-video")
+            clip = register_file(
+                session,
+                config_arg,
+                output,
+                kind="video_clip",
+                content_id=content_id,
+                mime_type="video/mp4",
+                filename="fullscreen.mp4",
+            )
+            session.commit()
+            return {"asset_id": clip.id, "task_id": "fixture-h3"}
+
+    monkeypatch.setattr("app.video_provider.invoke_video", invoke_video)
+    monkeypatch.setattr(
+        "app.integrations.local_ai.run_local",
+        lambda *_args, **_kwargs: pytest.fail("image scenes must use H3 native audio"),
+    )
+    monkeypatch.setattr("app.workflow.render", lambda _ctx: None)
+    assert Worker(config, engine=engine).run_once()
+    assert len(observed) == 1
+    assert observed[0]["references"]["image"]["asset_id"] == portrait_id
+    assert observed[0]["references"]["audio"] is not None
+    with Session(engine) as session:
+        content = session.get(Content, content_id)
+        scene = content.scenes[0]
+        assert scene["audio_asset_ids"] == [scene["video_asset_id"]]
+        image = session.get(Asset, scene["image_asset_id"])
+        assert image.kind == "image"
+        assert image.content_id == content_id
+        assert image.sha256 == portrait_sha
 
 
 def test_regular_asset_generation_preserves_selected_audio(client, engine, config, content_id, monkeypatch):

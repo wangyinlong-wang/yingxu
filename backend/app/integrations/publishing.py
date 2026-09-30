@@ -25,6 +25,9 @@ def open_account_profile(*, serial, platform, account_identifier, canceled, app_
         (name for name, item in ui._PLATFORMS.items() if item["package"] == package), None
     )
     current_page = ui._classify_page(current_platform, package, nodes) if current_platform else "unknown"
+    if current_platform == platform == "xiaohongshu" and "添加章节，在视频上划重点！" in ui._tokens(nodes):
+        # The preparation worker validates its saved selection before dismissing this tip.
+        return
     if current_page in {"editor", "picker", "camera"}:
         if current_platform == platform:
             return
@@ -124,6 +127,23 @@ def detect_published_work(
     page, package, nodes = ui._guarded_page(phone, platform)
     if package != config["package"] or page in {"login", "permission", "captcha", "locked"}:
         raise IntegrationError("DEVICE_USER_ACTION_REQUIRED", "请在绑定手机上打开刚发布的目标作品详情页")
+    if platform == "xiaohongshu" and page in {"home", "profile"}:
+        open_account_profile(serial=serial, platform=platform, account_identifier=account_identifier,
+                             canceled=canceled, app_config=app_config)
+        page, package, nodes = ui._guarded_page(phone, platform)
+        if page != "profile" or not ui._account_visible(ui._tokens(nodes), config, account_identifier):
+            raise IntegrationError("ACCOUNT_MISMATCH", "未能核验已发布作品的本人主页")
+        if not ui._click_unique(phone, nodes, (title,)):
+            cards = [node for node in nodes if node.get("clickable")
+                     and node.get("description", "").startswith(f"视频,{title},来自")]
+            selected = ui._selector(phone, cards[0], nodes, require_clickable=True) if len(cards) == 1 else None
+            if selected is None:
+                raise IntegrationError("WORK_TITLE_MISMATCH", "本人主页未显示唯一的已审核作品标题")
+            ui._click_selected(phone, selected)
+        time.sleep(ui._WAIT_AFTER_NAVIGATION)
+        page, package, nodes = ui._guarded_page(phone, platform)
+        if package != config["package"] or page == "profile":
+            raise IntegrationError("WORK_LINK_UNAVAILABLE", "未进入已审核作品详情")
     tokens = ui._tokens(nodes)
     if not _published_title_visible(tokens, title):
         raise IntegrationError("WORK_TITLE_MISMATCH", "当前手机页面未显示已审核作品标题，未读取链接")
@@ -200,7 +220,7 @@ def submit_publication(
         raise CanceledError()
     ui._click_selected(phone, selected)
     declaration_selected = False
-    if platform == "xiaohongshu" and version == "9.46.0":
+    if platform == "xiaohongshu" and version in {"9.46.0", "9.47.0"}:
         time.sleep(ui._WAIT_AFTER_NAVIGATION)
         _page, package, nodes = ui._guarded_page(phone, platform)
         tokens = ui._tokens(nodes)
@@ -216,7 +236,7 @@ def submit_publication(
             )
         time.sleep(ui._WAIT_AFTER_NAVIGATION)
         _page, package, nodes = ui._guarded_page(phone, platform)
-        confirm_node = ui._unique_node(nodes, ("确认并发布",))
+        confirm_node = ui._unique_node([node for node in nodes if node.get("clickable")], ("确认并发布",))
         confirm_control = (
             ui._selector(phone, confirm_node, nodes, require_clickable=True)
             if confirm_node
@@ -283,3 +303,30 @@ def submit_publication(
             "reason": "已点击最终发布，尚未取得足够的成功页面与作品链接证据；不会重复提交",
         },
     }
+
+
+def finish_pending_declaration(*, serial, account_identifier, video_sha256, caption, evidence,
+                               app_config, record_submit):
+    """Finish only the still-visible XHS declaration; never replay the editor submit."""
+    platform = "xiaohongshu"
+    phone = ui._connect_device(serial)
+    if not ui.ensure_unlocked(serial, phone, app_config=app_config):
+        raise IntegrationError("DEVICE_USER_ACTION_REQUIRED", "请解锁绑定手机")
+    version = ui._package_version(serial, ui._platform(platform)["package"])
+    if version not in {"9.46.0", "9.47.0"} or not ui._valid_previous_evidence(
+        evidence, serial=serial, platform=platform, app_version=version,
+        account_identifier=account_identifier, video_sha256=video_sha256, caption=caption,
+    ):
+        raise IntegrationError("PUBLISH_EVIDENCE_REQUIRED", "原账号和素材核验已变化或过期")
+    ui._verify_remote_video_hash(serial, evidence.get("remote_video_path", ""), video_sha256)
+    _page, package, nodes = ui._guarded_page(phone, platform)
+    tokens = ui._tokens(nodes)
+    if package != ui._platform(platform)["package"] or not {"声明内容来源", "含 AI 合成内容"}.issubset(tokens):
+        raise IntegrationError("CONTENT_DECLARATION_REQUIRED", "手机已不在原内容来源声明页，不会重复提交")
+    node = ui._unique_node([node for node in nodes if node.get("clickable")], ("确认并发布",))
+    selected = ui._selector(phone, node, nodes, require_clickable=True) if node else None
+    if selected is None:
+        raise IntegrationError("CONTENT_DECLARATION_UNCONFIRMED", "无法唯一识别确认并发布按钮")
+    record_submit("intent")
+    ui._click_selected(phone, selected, expected_package=package)
+    record_submit("clicked")

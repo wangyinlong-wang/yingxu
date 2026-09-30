@@ -14,6 +14,42 @@ from app.models import Asset, Content, QualityReview, Source, Template, Topic, u
 from app.schemas import Script
 
 
+class FakeKeychainBackend:
+    """Isolated in-memory credential backend; tests never touch the real macOS Keychain."""
+
+    def __init__(self):
+        self.items: dict[tuple[str, str], str] = {}
+        self.error = None
+
+    def _raise_if_unavailable(self):
+        if self.error is not None:
+            raise self.error
+
+    def set(self, service, account, secret):
+        self._raise_if_unavailable()
+        self.items[(service, account)] = secret
+
+    def get(self, service, account, *, max_length=12):
+        self._raise_if_unavailable()
+        value = self.items.get((service, account))
+        return value if value is None or len(value) <= max_length else None
+
+    def contains(self, service, account):
+        self._raise_if_unavailable()
+        return (service, account) in self.items
+
+    def delete(self, service, account):
+        self._raise_if_unavailable()
+        return self.items.pop((service, account), None) is not None
+
+
+@pytest.fixture(autouse=True)
+def fake_keychain(monkeypatch):
+    backend = FakeKeychainBackend()
+    monkeypatch.setattr("app.model_credentials._backend", lambda: backend)
+    return backend
+
+
 @pytest.fixture
 def config(tmp_path):
     return AppConfig(
@@ -23,6 +59,7 @@ def config(tmp_path):
         text_api_key=SecretStr("fixture-not-a-real-api-key"),
         image_api_key=SecretStr("fixture-not-a-real-api-key"),
         speech_api_key=SecretStr("fixture-not-a-real-api-key"),
+        video_api_key=SecretStr("fixture-not-a-real-api-key"),
     )
 
 

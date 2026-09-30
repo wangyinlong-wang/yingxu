@@ -130,6 +130,12 @@ def restore(config: AppConfig, path: Path) -> dict:
                 settings_value = json.loads(record[0])
                 for model in settings_value["models"].values():
                     model["enabled"] = False
+                    if isinstance(model.get("local"), dict):
+                        model["local"]["enabled"] = False
+                    # A restored builtin selection must not silently replay native inference.
+                    if model.get("source") == "builtin":
+                        model["source"] = "third_party"
+                settings_value.setdefault("local_ai", {})["voice_enabled"] = False
                 settings_value.setdefault("publishing", {})["auto_publish_after_approval"] = False
                 database.execute(
                     "UPDATE settings SET value=? WHERE key='app'",

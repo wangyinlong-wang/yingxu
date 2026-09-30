@@ -10,7 +10,7 @@ import sys
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, UploadFile
@@ -24,6 +24,15 @@ from . import __version__
 from .config import AppConfig
 from .db import settings
 from .integrations.local_ai import local_status
+from .model_credentials import (
+    delete_model_key,
+    delete_tikhub_key,
+    model_key_status,
+    resolve_model_key,
+    set_model_key,
+    set_tikhub_key,
+    tikhub_key_status,
+)
 from .models import (
     Account,
     Approval,
@@ -49,6 +58,8 @@ from .models import (
 )
 from .presets import list_presets, preset_by_id
 from .schemas import (
+    PAID_SOURCE_KINDS,
+    X_PROFILE_KINDS,
     AccountInput,
     AllSettings,
     BenchmarkCreate,
@@ -65,6 +76,7 @@ from .schemas import (
     LocalAIPreview,
     LocalAITranscribe,
     MetricInput,
+    ModelKeyAction,
     ProductionBrief,
     PublicationCancel,
     PublicationConfirm,
@@ -77,19 +89,26 @@ from .schemas import (
     SourceCollect,
     SourceCreate,
     SourcePatch,
+    SourcePresetApply,
     TemplateInput,
-    canonical_x_profile_url,
+    TikhubKeyAction,
+    TopicImport,
+    WirelessConnectInput,
+    WirelessPairInput,
+    canonical_source_url_for,
 )
 from .services import (
     AppError,
     accepted,
     acquire_write,
+    active_model,
     approved_snapshot_matches,
     assert_editable,
     assert_models,
     asset_dict,
     asset_path,
     checked_asset,
+    checked_scene_audio,
     content_snapshot,
     current_quality_review,
     day_bounds,
@@ -109,6 +128,9 @@ from .services import (
     usage_summary,
     validate_local_ai_settings,
 )
+from .source_presets import SOURCE_PRESETS
+from .source_presets import preset_by_id as source_preset_by_id
+from .topic_ranking import heat_score
 
 router = APIRouter(prefix="/api/v1")
 
@@ -141,6 +163,7 @@ def current_content_status(content: Content) -> str:
 def _normalized_scenes(scenes: list[dict]) -> list[dict]:
     normalized = copy.deepcopy(scenes)
     for scene in normalized:
+        scene.setdefault("video_asset_id", None)
         scene.setdefault("motion", "auto")
         scene.setdefault("transition", "fade")
         scene.setdefault("scene_type", "image")
@@ -211,16 +234,23 @@ def diagnostics_data(session: Session, config: AppConfig) -> dict:
             and datetime.fromisoformat(heartbeat.last_seen) > datetime.now(UTC) - timedelta(seconds=30)
         )
         workers[queue] = {"online": online, "last_seen": heartbeat.last_seen if heartbeat else None}
-    model_status = {
-        kind: {
-            "configured": bool(
-                config.key(kind) and values["base_url"] and values["model"] and values["enabled"]
+    model_status = {}
+    for kind, values in current["models"].items():
+        source, profile = active_model(current, kind)
+        if source == "builtin":
+            configured = local_speech_ready
+        elif source == "local":
+            configured = bool(
+                profile.get("enabled") and profile.get("base_url") and profile.get("model")
             )
-        }
-        for kind, values in current["models"].items()
-    }
-    if current["local_ai"]["voice_enabled"]:
-        model_status["speech"]["configured"] = local_speech_ready
+        else:
+            configured = bool(
+                values["enabled"]
+                and values["base_url"]
+                and values["model"]
+                and model_key_status(config, kind, "third_party", values["base_url"])["key_configured"]
+            )
+        model_status[kind] = {"configured": configured, "source": source}
     model_status["speech"]["local"] = local_speech_ready
     warnings = []
     if not ffmpeg:
@@ -229,8 +259,8 @@ def diagnostics_data(session: Session, config: AppConfig) -> dict:
         warnings.append("未找到 ADB；真机操作需要先安装 Android Platform Tools 并由你完成 USB 调试授权")
     elif not adb_supported:
         warnings.append("ADB 版本过旧；真机发布要求 Android Debug Bridge 1.0.41 或更新版本")
-    if not all(item["configured"] for item in model_status.values()):
-        warnings.append("模型能力尚未全部配置；请在本地 .env 设置对应密钥，再在设置中填写并启用接口")
+    if not all(model_status[kind]["configured"] for kind in ("text", "image", "speech")):
+        warnings.append("模型能力尚未全部配置；请在模型与视频页填写接口并保存密钥，或配置对应环境变量")
     if not workers["content"]["online"]:
         warnings.append("内容任务进程未连接，已提交的任务将保留在队列中")
     return {
@@ -293,10 +323,47 @@ def presets():
 
 @router.post("/sources", status_code=201)
 def create_source(data: SourceCreate, session: DB):
-    item = Source(**data.model_dump())
+    values = data.model_dump()
+    values["options"] = {key: value for key, value in values["options"].items() if value is not None}
+    item = Source(**values)
     session.add(item)
     session.commit()
     return row(item)
+
+
+@router.get("/source-presets")
+def source_presets(session: DB):
+    existing = {url for url in session.scalars(select(Source.url))}
+    return listed([{**preset, "added": preset["url"] in existing} for preset in SOURCE_PRESETS])
+
+
+@router.post("/source-presets/apply", status_code=201)
+def apply_source_presets(data: SourcePresetApply, session: DB):
+    """Add chosen recommended sources; existing URLs are never duplicated or overwritten."""
+    acquire_write(session)
+    presets = []
+    for identifier in dict.fromkeys(data.ids):
+        preset = source_preset_by_id(identifier)
+        if not preset:
+            raise AppError("SOURCE_PRESET_NOT_FOUND", "推荐来源不存在，请刷新后重试", 404)
+        presets.append(preset)
+    existing = {url for url in session.scalars(select(Source.url))}
+    created = []
+    for preset in presets:
+        if preset["url"] in existing:
+            continue
+        item = Source(
+            name=preset["name"],
+            kind=preset["kind"],
+            url=preset["url"],
+            options=copy.deepcopy(preset.get("options", {})),
+            enabled=True,
+        )
+        session.add(item)
+        session.flush()
+        created.append(row(item))
+    session.commit()
+    return {"items": created, "skipped": len(presets) - len(created)}
 
 
 @router.patch("/sources/{identifier}")
@@ -304,16 +371,23 @@ def update_source(identifier: str, data: SourcePatch, session: DB):
     acquire_write(session)
     item = require(session, Source, identifier)
     changes = data.model_dump(exclude_none=True)
-    if "kind" in changes and item.kind not in {"x", "x_tikhub"}:
+    if "kind" in changes and item.kind not in X_PROFILE_KINDS:
         raise AppError("SOURCE_KIND_CHANGE_FORBIDDEN", "仅可在两个 X 数据提供方式之间切换", 409)
     effective_kind = changes.get("kind", item.kind)
-    if effective_kind in {"x", "x_tikhub"} and ("url" in changes or "kind" in changes):
+    if "url" in changes or "kind" in changes:
         try:
-            changes["url"] = canonical_x_profile_url(changes.get("url", item.url))
-        except ValueError:
-            raise AppError("SOURCE_URL_INVALID", "X 来源必须是公开账号主页地址", 422) from None
+            changes["url"] = canonical_source_url_for(effective_kind, changes.get("url", item.url))
+        except ValueError as error:
+            raise AppError("SOURCE_URL_INVALID", str(error).removeprefix("Value error, "), 422) from None
+    if "options" in changes:
+        if changes["options"].get("path_prefix") and effective_kind != "html_list":
+            raise AppError("SOURCE_OPTIONS_INVALID", "只有网页列表来源可以设置文章路径前缀", 422)
+        changes["options"] = {key: value for key, value in changes["options"].items() if value is not None}
     for key, value in changes.items():
         setattr(item, key, value)
+    if data.enabled:
+        # Re-enabling is an explicit user decision; clear the automatic backoff window.
+        item.next_eligible_at = None
     session.commit()
     return row(item)
 
@@ -333,7 +407,7 @@ def collect_source_route(
     expected_kind = data.expected_kind if data else None
     if expected_kind is not None and expected_kind != source.kind:
         raise AppError("SOURCE_PROVIDER_CHANGED", "信息源提供方式已变化，请刷新来源页面后重试", 409)
-    if source.kind == "x_tikhub" and expected_kind != "x_tikhub":
+    if source.kind in PAID_SOURCE_KINDS and expected_kind != source.kind:
         raise AppError("SOURCE_PROVIDER_CHANGED", "请刷新来源页面并明确确认使用 TikHub 后再采集", 409)
     snapshot = {"id": source.id, "kind": source.kind, "url": source.url}
     payload = {
@@ -347,9 +421,9 @@ def collect_source_route(
             if existing.kind != "COLLECT_SOURCE" or existing.payload != payload:
                 raise AppError("IDEMPOTENCY_CONFLICT", "同一操作标识已用于不同采集请求", 409)
             return accepted(existing)
-    if source.kind == "x_tikhub":
-        if not config.tikhub_api_key.get_secret_value():
-            raise AppError("TIKHUB_NOT_CONFIGURED", "请先在本机配置 TikHub API Key", 409)
+    if source.kind in PAID_SOURCE_KINDS:
+        if not tikhub_key_status(config)["key_configured"]:
+            raise AppError("TIKHUB_NOT_CONFIGURED", "请先在「模板与设置 → 模型与视频」保存 TikHub API Key", 409)
         current = settings(session, config)
         if usage_summary(session, current["timezone"])["calls_today"] >= current["limits"][
             "daily_calls"
@@ -361,16 +435,60 @@ def collect_source_route(
 
 
 @router.get("/topics")
-def list_topics(session: DB, q: str = "", limit: int = Query(100, ge=1, le=500)):
+def list_topics(
+    session: DB,
+    q: str = "",
+    limit: int = Query(100, ge=1, le=500),
+    sort: Literal["heat", "relevance"] = "heat",
+    days: int | None = Query(None, ge=1, le=30),
+):
     statement = select(Topic)
+    if days:
+        # Only verifiably recent items: undated topics cannot prove they fall inside the window.
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        statement = statement.where(Topic.published_at >= cutoff)
     if q:
         statement = statement.where(
             Topic.title.contains(q, autoescape=True) | Topic.summary.contains(q, autoescape=True)
         )
-    items = session.scalars(
-        statement.order_by(Topic.relevance_score.desc(), Topic.created_at.desc()).limit(limit)
+    if sort == "relevance":
+        items = list(session.scalars(statement.order_by(Topic.relevance_score.desc(), Topic.created_at.desc()).limit(limit)))
+    else:
+        # Heat decays with time, so rank the newest window in memory instead of storing a stale score.
+        instant = datetime.now(UTC)
+        recent = session.scalars(statement.order_by(Topic.created_at.desc()).limit(1000))
+        items = sorted(recent, key=lambda topic: heat_score(topic, instant), reverse=True)[:limit]
+    instant = datetime.now(UTC)
+    return listed([{**row(item), "heat_score": heat_score(item, instant)} for item in items])
+
+
+@router.post("/topics/import")
+def import_topic(data: TopicImport, session: DB):
+    from .workflow import normalize_source_url
+
+    acquire_write(session)
+    source = require(session, Source, data.source_id)
+    url = normalize_source_url(data.url)
+    fingerprint = digest(
+        [re.sub(r"\s+", " ", data.title).casefold(), re.sub(r"\s+", " ", data.summary).casefold()]
     )
-    return listed([row(item) for item in items])
+    existing = session.scalar(
+        select(Topic).where((Topic.url == url) | (Topic.fingerprint == fingerprint))
+    )
+    if existing:
+        # Repeated imports must not overwrite a selected topic or its existing draft.
+        return {"topic": row(existing), "created": False}
+    topic = Topic(
+        source_id=source.id,
+        title=data.title,
+        url=url,
+        summary=data.summary,
+        fingerprint=fingerprint,
+        selection_reason="人工录入原帖；未自动抓取或核验，制作后仍须逐项复核事实。",
+    )
+    session.add(topic)
+    session.commit()
+    return {"topic": row(topic), "created": True}
 
 
 @router.post("/topics/{identifier}/content", status_code=201)
@@ -534,10 +652,25 @@ def edit_content(identifier: str, data: ContentPatch, session: DB, config: Env):
                 "audio_asset_ids", []
             ):
                 scene["audio_asset_ids"] = []
+            if "video_asset_id" not in scene_input.model_fields_set:
+                scene["video_asset_id"] = previous.get("video_asset_id")
+            if (
+                any(scene.get(field) != previous.get(field) for field in ("image_prompt", "narration", "scene_type"))
+                and scene.get("video_asset_id") == previous.get("video_asset_id")
+            ):
+                scene["video_asset_id"] = None
+            if scene.get("video_asset_id"):
+                clip = checked_asset(session, config, scene["video_asset_id"], {"video_clip"})
+                if clip.content_id != content.id:
+                    raise AppError("INVALID_ASSET", "视频片段不属于当前内容", 422)
             if scene["image_asset_id"]:
                 checked_asset(session, config, scene["image_asset_id"], {"image"})
-            for asset_id in scene["audio_asset_ids"]:
-                checked_asset(session, config, asset_id, {"audio"})
+            if (
+                scene.get("video_asset_id") != previous.get("video_asset_id")
+                and scene["audio_asset_ids"] == [previous.get("video_asset_id")]
+            ):
+                scene["audio_asset_ids"] = []
+            checked_scene_audio(session, config, content.id, scene)
     if all(
         _normalized_scenes(content.scenes) == _normalized_scenes(value)
         if key == "scenes"
@@ -574,12 +707,27 @@ def edit_content(identifier: str, data: ContentPatch, session: DB, config: Env):
 def generate_content(identifier: str, data: Generation, session: DB, config: Env, key: Key = None):
     acquire_write(session)
     content = require(session, Content, identifier)
+    avatar_layout = (data.avatar_layout or "corner") if data.stage == "local_avatar_all" else None
+    fullscreen_avatar = avatar_layout == "fullscreen"
     payload = {
         "content_id": identifier,
         "version": content.version,
         "stage": data.stage,
         "scene_id": data.scene_id,
     }
+    if avatar_layout:
+        payload["avatar_layout"] = avatar_layout
+    confirmed_video_options = (
+        {"clip_duration": data.clip_duration, "clip_resolution": data.clip_resolution}
+        if data.clip_duration is not None else None
+    )
+    if confirmed_video_options:
+        payload["confirmed_video_options"] = confirmed_video_options
+    reference_ids = {kind: identifier for kind, identifier in (
+        ("image", data.reference_image_asset_id), ("audio", data.reference_audio_asset_id)
+    ) if identifier}
+    if reference_ids:
+        payload["video_reference_ids"] = reference_ids
     if data.stage == "motion":
         payload["motion_input"] = {
             "title": content.title,
@@ -599,12 +747,17 @@ def generate_content(identifier: str, data: Generation, session: DB, config: Env
                 or existing.payload.get("content_id") != identifier
                 or existing.payload.get("stage") != data.stage
                 or existing.payload.get("scene_id") != data.scene_id
+                or existing.payload.get("avatar_layout") != avatar_layout
+                or existing.payload.get("confirmed_video_options") != confirmed_video_options
+                or existing.payload.get("video_reference_ids", {}) != reference_ids
             ):
                 raise AppError("IDEMPOTENCY_CONFLICT", "同一操作标识已用于不同请求", 409)
             return accepted(existing)
     assert_editable(session, content, content.version)
-    if data.stage in {"script", "all"} and content.brief and not content.brief.get(
-        "selected_concept_id"
+    if (
+        data.stage in {"script", "all", "local_avatar_all"}
+        and content.brief
+        and not content.brief.get("selected_concept_id")
     ):
         raise AppError("BRIEF_SELECTION_REQUIRED", "请先选择一个创意方案", 409)
     if data.stage != "render":
@@ -629,21 +782,49 @@ def generate_content(identifier: str, data: Generation, session: DB, config: Env
             )
     if data.stage in {"brief", "script"}:
         assert_models(session, config, ("text",))
-    elif data.stage == "all":
+    elif data.stage in {"all", "local_avatar_all"}:
         required = set()
         if not content.scenes:
             required.add("text")
-            required.update(["image", "speech"])
+            if fullscreen_avatar:
+                required.add("video")
+            else:
+                required.add("image")
+            if data.stage == "all":
+                required.add("speech")
         else:
-            if any(
+            if fullscreen_avatar:
+                image_scenes = [
+                    scene for scene in content.scenes if scene.get("scene_type", "image") == "image"
+                ]
+                if not image_scenes:
+                    raise AppError(
+                        "FULLSCREEN_AVATAR_SCENE_REQUIRED", "全屏数字人至少需要一个图片镜头", 409
+                    )
+                if any(not str(scene.get("narration") or "").strip() for scene in image_scenes):
+                    raise AppError(
+                        "NARRATION_REQUIRED", "全屏数字人的每个口播镜头都需要旁白", 409
+                    )
+                if any(not str(scene.get("image_prompt") or "").strip() for scene in image_scenes):
+                    raise AppError(
+                        "VIDEO_PROMPT_REQUIRED", "全屏数字人的每个口播镜头都需要画面描述", 409
+                    )
+                required.add("video")
+            elif any(
                 scene.get("scene_type", "image") == "image" and not scene.get("image_asset_id")
                 for scene in content.scenes
             ):
                 required.add("image")
-            if any(not scene.get("audio_asset_ids") for scene in content.scenes):
+            if data.stage == "all" and any(not scene.get("audio_asset_ids") for scene in content.scenes):
                 required.add("speech")
         if required:
-            assert_models(session, config, tuple(required))
+            current = assert_models(session, config, tuple(required))
+            if fullscreen_avatar:
+                payload["video_options"] = {
+                    key: current["video"][key]
+                    for key in ("clip_duration", "clip_resolution", "width", "height")
+                }
+                payload["video_options"].update(confirmed_video_options or {})
     elif data.stage == "assets":
         if not content.scenes:
             raise AppError("SCRIPT_REQUIRED", "请先生成或保存分镜", 409)
@@ -686,13 +867,34 @@ def generate_content(identifier: str, data: Generation, session: DB, config: Env
             raise AppError("ASSETS_REQUIRED", "每个分镜都需要图片和配音，才能编排动画并合成", 409)
         for scene in content.scenes:
             checked_asset(session, config, scene["image_asset_id"], {"image"})
-            for asset_id in scene["audio_asset_ids"]:
-                checked_asset(session, config, asset_id, {"audio"})
+            checked_scene_audio(session, config, content.id, scene)
         current = assert_models(session, config, ("text",))
         if usage_summary(session, current["timezone"])["calls_today"] >= current["limits"][
             "daily_calls"
         ]:
             raise AppError("DAILY_CALL_LIMIT", "已达到今日模型调用上限，请调整额度或次日重试", 409)
+    elif data.stage == "video":
+        target = next((scene for scene in content.scenes if scene.get("id") == data.scene_id), None)
+        if not target:
+            raise AppError("SCENE_NOT_FOUND", "找不到需要生成视频的分镜", 404)
+        if target.get("scene_type", "image") != "image":
+            raise AppError("VIDEO_SCENE_INVALID", "AI 视频仅用于图片分镜，数据与引语卡保留准确文字", 422)
+        if not target.get("image_prompt", "").strip():
+            raise AppError("VIDEO_PROMPT_REQUIRED", "请先填写该分镜的画面描述", 409)
+        current = assert_models(session, config, ("video",))
+        payload["video_options"] = {key: current["video"][key] for key in ("clip_duration", "clip_resolution", "width", "height")}
+        if confirmed_video_options:
+            payload["video_options"].update(confirmed_video_options)
+        if reference_ids:
+            payload["video_references"] = {}
+            for kind, asset_id in reference_ids.items():
+                reference = checked_asset(session, config, asset_id,
+                    {"portrait", "image"} if kind == "image" else {"voice_reference", "audio"})
+                if reference.content_id not in {None, content.id}:
+                    raise AppError("INVALID_ASSET", "参考素材不属于当前内容", 422)
+                payload["video_references"][kind] = {"asset_id": reference.id, "sha256": reference.sha256}
+        if usage_summary(session, current["timezone"])["calls_today"] >= current["limits"]["daily_calls"]:
+            raise AppError("DAILY_CALL_LIMIT", "已达到今日模型调用上限", 409)
     elif data.stage == "images":
         if not content.scenes:
             raise AppError("SCRIPT_REQUIRED", "请先生成或保存分镜", 409)
@@ -705,8 +907,7 @@ def generate_content(identifier: str, data: Generation, session: DB, config: Env
         if any(not scene.get("audio_asset_ids") for scene in content.scenes):
             raise AppError("AUDIO_REQUIRED", "每个分镜都需要配音，才能重绘配图并合成", 409)
         for scene in content.scenes:
-            for asset_id in scene["audio_asset_ids"]:
-                checked_asset(session, config, asset_id, {"audio"})
+            checked_scene_audio(session, config, content.id, scene)
             if scene["id"] not in targets:
                 if not scene.get("image_asset_id"):
                     raise AppError("IMAGES_REQUIRED", "未重绘的分镜必须已有图片", 409)
@@ -721,7 +922,7 @@ def generate_content(identifier: str, data: Generation, session: DB, config: Env
         if calls_today + len(image_targets) > current["limits"]["daily_calls"]:
             raise AppError("DAILY_CALL_LIMIT", "剩余模型调用额度不足以完成本次重绘", 409)
         payload["image_scene_ids"] = [scene_id for scene_id in scene_ids if scene_id in targets]
-    if data.stage in {"all", "render", "local_voice", "motion", "images"}:
+    if data.stage in {"all", "render", "local_voice", "local_avatar_all", "motion", "images"}:
         current = settings(session, config)
         start, end = day_bounds(current["timezone"])
         existing_today = list(
@@ -778,10 +979,12 @@ def generate_content(identifier: str, data: Generation, session: DB, config: Env
         content.status = "DRAFT"
         payload["version"] = content.version
         save_revision(session, content)
-    elif data.stage == "local_voice":
+    elif data.stage == "local_voice" or (data.stage == "local_avatar_all" and content.scenes):
         scenes = copy.deepcopy(content.scenes)
         for scene in scenes:
             scene["audio_asset_ids"] = []
+            if data.stage == "local_avatar_all":
+                scene["video_asset_id"] = None
         content.scenes = scenes
         content.version += 1
         content.media_version = None
@@ -794,17 +997,32 @@ def generate_content(identifier: str, data: Generation, session: DB, config: Env
         content.video_asset_id = content.cover_asset_id = content.subtitle_asset_id = None
         payload["version"] = content.version
         save_revision(session, content)
-    needs_voice = data.stage == "local_voice" or (
+    needs_voice = data.stage in {"local_voice", "local_avatar_all"} or (
         data.stage in {"all", "assets"}
         and (not content.scenes or any(not scene.get("audio_asset_ids") for scene in content.scenes))
+    )
+    native_video_audio = data.stage == "render" and any(
+        scene.get("video_asset_id")
+        and scene.get("audio_asset_ids") == [scene["video_asset_id"]]
+        for scene in content.scenes
     )
     payload["local_ai"] = local_ai_profile_snapshot(
         session,
         config,
         include_voice=needs_voice,
-        include_avatar=data.stage in {"all", "render", "local_voice", "motion", "images"},
-        force_voice=data.stage == "local_voice",
+        include_avatar=(
+            (data.stage in {"all", "render", "local_voice", "motion", "images"} and not native_video_audio)
+            or (data.stage == "local_avatar_all" and not fullscreen_avatar)
+        ),
+        force_voice=data.stage in {"local_voice", "local_avatar_all"},
+        force_avatar=data.stage == "local_avatar_all" and not fullscreen_avatar,
+        include_portrait=fullscreen_avatar,
     )
+    if fullscreen_avatar:
+        payload["video_references"] = {
+            "image": payload["local_ai"]["portrait"],
+            "audio": payload["local_ai"]["reference_audio"],
+        }
     job = enqueue(session, kind="GENERATE_CONTENT", payload=payload, content_id=identifier, key=key)
     content.status = "GENERATING"
     session.commit()
@@ -1076,7 +1294,7 @@ def transcribe_local_audio(
     request = data.model_dump()
     if replayed := _local_job_replay(session, key, "LOCAL_AI_TRANSCRIBE", request):
         return accepted(replayed)
-    source = checked_asset(session, config, data.asset_id, {"voice_reference"})
+    source = checked_asset(session, config, data.asset_id, {"voice_reference", "video_clip"})
     status = local_status(config)
     if not status["transcribe"]["installed"]:
         raise AppError("LOCAL_AI_TRANSCRIBE_NOT_INSTALLED", "本地转写模型尚未完整安装", 409)
@@ -1094,7 +1312,7 @@ def transcribe_local_audio(
     if replayed := _local_job_replay(session, key, "LOCAL_AI_TRANSCRIBE", request):
         session.commit()
         return accepted(replayed)
-    current = checked_asset(session, config, data.asset_id, {"voice_reference"})
+    current = checked_asset(session, config, data.asset_id, {"voice_reference", "video_clip"})
     if current.sha256 != payload["source"]["sha256"]:
         raise AppError("ASSET_CHANGED", "参考音频已变化，请重新提交", 409)
     job = enqueue(session, kind="LOCAL_AI_TRANSCRIBE", payload=payload, key=key)
@@ -1316,15 +1534,17 @@ def retry_job(identifier: str, session: DB):
         raise AppError("RESTORE_REVIEW_REQUIRED", "请先核验备份恢复前后的实际执行结果，不能直接重试", 409)
     if job.kind == "PREPARE_PUBLICATION":
         raise AppError("USE_PUBLICATION_RESUME", "请在发布中心核验手机状态后选择继续准备", 409)
-    if session.scalar(
-        select(ModelCall.id).where(
-            ModelCall.job_id == identifier, ModelCall.status.in_(["STARTED", "UNKNOWN"])
-        )
-    ):
+    from .video_provider import resumable_video_call
+
+    pending = list(session.scalars(select(ModelCall).where(
+        ModelCall.job_id == identifier, ModelCall.status.in_(["STARTED", "UNKNOWN"])
+    )))
+    resume_video = bool(pending) and all(resumable_video_call(call) for call in pending)
+    if pending and not resume_video:
         raise AppError(
             "MODEL_OUTCOME_UNKNOWN", "本次模型调用结果未确认，请先核验服务商记录，不能直接重复调用", 409
         )
-    if job.status not in {"FAILED", "CANCELED"}:
+    if job.status not in ({"FAILED", "CANCELED", "WAITING_USER"} if resume_video else {"FAILED", "CANCELED"}):
         raise AppError("JOB_NOT_RETRYABLE", "仅失败或已取消的任务可以重试", 409)
     if job.content_id and job.kind == "GENERATE_CONTENT":
         content = require(session, Content, job.content_id)
@@ -1338,7 +1558,8 @@ def retry_job(identifier: str, session: DB):
                 # Explicit retry of invalid structured output authorizes a fresh request, with its own usage event.
                 call.status, call.error_code = "FAILED", "INVALID_OUTPUT_RETRY_REQUESTED"
     job.status, job.cancel_requested, job.error_code, job.error_message = "QUEUED", False, None, None
-    job.payload = {key: value for key, value in job.payload.items() if key != "model_requests"}
+    if job.payload.get("stage") != "video":
+        job.payload = {key: value for key, value in job.payload.items() if key != "model_requests"}
     job.lease_owner = job.lease_until = None
     job.current_step = "等待重试（复用已完成步骤）"
     session.commit()
@@ -1430,6 +1651,71 @@ def devices():
     from .integrations.device import list_devices
 
     return listed(list_devices())
+
+
+@router.post("/devices/wireless-pair")
+def pair_wireless_device(data: WirelessPairInput):
+    from .integrations.device import pair_wireless_device as pair_device
+
+    return pair_device(
+        data.ip,
+        data.pairing_port,
+        data.connection_port,
+        data.pairing_code.get_secret_value(),
+    )
+
+
+@router.post("/devices/wireless-connect")
+def connect_wireless_device(data: WirelessConnectInput):
+    from .integrations.device import connect_wireless_device as connect_device
+
+    return connect_device(data.ip, data.connection_port)
+
+
+@router.post("/devices/wireless-qr")
+def start_wireless_qr():
+    from .integrations.device import start_wireless_qr as start_pairing
+
+    return start_pairing()
+
+
+@router.post("/devices/wireless-qr/{token}/poll")
+def poll_wireless_qr(token: str):
+    from .integrations.device import poll_wireless_qr as poll_pairing
+
+    return poll_pairing(token)
+
+
+@router.get("/browser/status")
+def browser_status(config: Env):
+    from .integrations.browser import runtime_status
+
+    return runtime_status(config)
+
+
+def _browser_action(platform: str, action: str, session: Session, config: AppConfig):
+    from .integrations.browser import run_browser
+    from .services import device_lock
+
+    serial = f"browser:{platform}"
+    # Inspection is read-only. Opening a new page is not allowed to steal an active draft.
+    if action == "open" and session.scalar(select(Publication.id).where(Publication.reserved_serial == serial)):
+        raise AppError("DEVICE_RESERVED", "Chrome 有待处理发布，请先处理当前浏览器页面", 409)
+    account = session.scalar(select(Account).where(Account.platform == platform, Account.channel == "browser"))
+    expected = account.account_identifier if account else None
+    session.rollback()
+    with device_lock(config):
+        return run_browser(config, platform, action, account_identifier=expected)
+
+
+@router.post("/browser/{platform}/open")
+def open_browser(platform: Literal["douyin", "xiaohongshu"], session: DB, config: Env):
+    return _browser_action(platform, "open", session, config)
+
+
+@router.post("/browser/{platform}/inspect")
+def inspect_browser(platform: Literal["douyin", "xiaohongshu"], session: DB, config: Env):
+    return _browser_action(platform, "inspect", session, config)
 
 
 @router.post("/devices/{serial}/inspect")
@@ -1761,6 +2047,9 @@ def detect_publication(identifier: str, session: DB, config: Env):
     from .integrations.publishing import detect_published_work
     from .services import device_lock
 
+    if account.get("channel", "android") == "browser":
+        from .integrations.browser import detect_published_work
+
     with device_lock(config):
         detected = detect_published_work(
             serial=account["device_serial"],
@@ -1809,7 +2098,7 @@ def detect_publication(identifier: str, session: DB, config: Env):
             "at": now(),
         },
     }
-    job.status, job.progress, job.current_step = "SUCCEEDED", 100, "已从绑定手机识别并关联实际作品"
+    job.status, job.progress, job.current_step = "SUCCEEDED", 100, "已从绑定发布通道识别并关联实际作品"
     job.error_code = job.error_message = None
     session.commit()
     return publication_dict(publication)
@@ -1844,6 +2133,55 @@ def cancel_publication(identifier: str, data: PublicationCancel, session: DB):
         publication.reserved_serial = None
     session.commit()
     return publication_dict(publication)
+
+
+@router.post("/publications/{identifier}/finish-declaration")
+def finish_declaration(identifier: str, session: DB, config: Env, confirmed: bool = Body(False, embed=True)):
+    from .integrations.publishing import finish_pending_declaration
+    from .services import device_lock
+
+    if not confirmed:
+        raise AppError("DECLARATION_CONFIRMATION_REQUIRED", "请先核对手机已选中含 AI 合成内容", 422)
+    with device_lock(config):
+        acquire_write(session)
+        publication = require(session, Publication, identifier)
+        job = require(session, Job, publication.job_id)
+        evidence = copy.deepcopy(publication.evidence)
+        if (publication.platform != "xiaohongshu" or publication.status != "VERIFYING"
+            or job.status != "WAITING_USER" or job.error_code != "CONTENT_DECLARATION_UNCONFIRMED"
+            or not evidence.get("submit_started_at") or evidence.get("final_publish_clicked")
+            or evidence.get("declaration_confirm_started_at")):
+            raise AppError("PUBLICATION_OUTCOME_UNKNOWN", "当前记录不能补完声明确认，请核验作品结果", 409)
+        content = require(session, Content, publication.content_id)
+        if content.status != "APPROVED" or not publication_snapshot_matches(content, publication.snapshot):
+            raise AppError("APPROVAL_STALE", "审核内容已变化，不能继续发布", 409)
+        account = require(session, Account, publication.account_id)
+        frozen = publication.snapshot["account"]
+        if (account.channel != "android" or frozen.get("account_identifier") != account.account_identifier
+            or frozen.get("device_serial") != account.device_serial
+            or publication.reserved_serial != account.device_serial):
+            raise AppError("ACCOUNT_CHANGED", "绑定账号或设备已变化", 409)
+        video = checked_asset(session, config, publication.snapshot["video_asset_id"], {"video"})
+        text = publishable_script(publication.snapshot["script"]).platforms.xiaohongshu
+        caption = " ".join((text.title, text.description, " ".join("#" + tag.lstrip("#") for tag in text.tags)))
+        caption = " ".join(caption.split())
+
+        def record_submit(stage):
+            if stage == "intent":
+                publication.evidence = {**evidence, "declaration_confirm_started_at": now(),
+                                        "ai_declaration_operator_confirmed": True}
+                job.current_step = "已记录声明确认，执行最后一步发布"
+            else:
+                publication.evidence = {**publication.evidence, "final_publish_clicked": True,
+                                        "submit_clicked_at": now(), "content_declaration": "ai_generated"}
+                job.current_step = "声明确认已提交，等待从手机识别作品链接"
+                job.error_code = job.error_message = None
+            session.commit()
+
+        finish_pending_declaration(serial=account.device_serial, account_identifier=account.account_identifier,
+                                   video_sha256=video.sha256, caption=caption, evidence=evidence,
+                                   app_config=config, record_submit=record_submit)
+        return publication_dict(publication)
 
 
 @router.post("/publications/{identifier}/resume", status_code=202)
@@ -2179,13 +2517,50 @@ def edit_template(identifier: str, session: DB, data: Annotated[dict, Body()]):
 def public_settings(session: Session, config: AppConfig):
     current = settings(session, config)
     for kind, values in current["models"].items():
-        values["key_configured"] = bool(config.key(kind))
+        # Per-profile credential metadata bound to each profile's own URL; never secret data.
+        values.update(model_key_status(config, kind, "third_party", values["base_url"]))
+        values["key_base_url"] = values["base_url"]
+        values["local"].update(model_key_status(config, kind, "local", values["local"]["base_url"]))
+        values["local"]["key_base_url"] = values["local"]["base_url"]
     return current
 
 
 @router.get("/settings")
 def get_settings(session: DB, config: Env):
     return public_settings(session, config)
+
+
+@router.post("/settings/model-keys/{kind}")
+def manage_model_key(kind: str, data: ModelKeyAction, config: Env):
+    """Store or clear one URL-scoped model API key in the macOS Keychain; returns metadata only."""
+
+    if kind not in {"text", "image", "speech", "video"}:
+        raise AppError("INVALID_MODEL_KIND", "模型能力必须为 text、image、speech、video", 422)
+    if data.action == "set":
+        set_model_key(config, kind, data.source, data.base_url, data.api_key.get_secret_value())
+    else:
+        delete_model_key(config, kind, data.source, data.base_url)
+    # After a clear, key_source still discloses an active environment fallback (third-party only).
+    return model_key_status(config, kind, data.source, data.base_url)
+
+
+@router.get("/settings/tikhub-key")
+def get_tikhub_key_status(config: Env):
+    """Whether a TikHub key is configured and where it comes from; never the key itself."""
+
+    return tikhub_key_status(config)
+
+
+@router.post("/settings/tikhub-key")
+def manage_tikhub_key(data: TikhubKeyAction, config: Env):
+    """Store or clear the TikHub API key in the macOS Keychain; returns metadata only."""
+
+    if data.action == "set":
+        set_tikhub_key(config, data.api_key.get_secret_value())
+    else:
+        delete_tikhub_key(config)
+    # After a clear, key_source still discloses an active environment fallback.
+    return tikhub_key_status(config)
 
 
 def merge_settings(original: dict, patch: dict) -> dict:
@@ -2215,11 +2590,43 @@ def update_settings(session: DB, config: Env, data: Annotated[dict, Body()]):
                 ]
             },
         ) from None
-    for kind, model in validated["models"].items():
-        if model["enabled"] and not config.key(kind):
-            raise AppError(
-                "API_KEY_REQUIRED", f"请先在本地 .env 配置 PUBLISHER_{kind.upper()}_API_KEY 并重启服务", 409
-            )
+    # The speech source and the native local voice flag are two views of one choice. Legacy
+    # clients may PATCH only local_ai.voice_enabled; explicit contradictory pairs are rejected.
+    models_patch = data.get("models") if isinstance(data.get("models"), dict) else {}
+    speech_patch = models_patch.get("speech") if isinstance(models_patch.get("speech"), dict) else {}
+    local_patch = data.get("local_ai") if isinstance(data.get("local_ai"), dict) else {}
+    source_given = "source" in speech_patch
+    voice_given = "voice_enabled" in local_patch
+    speech = validated["models"]["speech"]
+    voice_enabled = bool(validated["local_ai"]["voice_enabled"])
+    if source_given and voice_given and (speech["source"] == "builtin") != voice_enabled:
+        raise AppError(
+            "CONTRADICTORY_SPEECH_SOURCE",
+            "语音模型来源与本地声音开关互相矛盾，请确认选择后重新保存",
+            422,
+        )
+    if voice_given and not source_given:
+        if voice_enabled:
+            speech["source"] = "builtin"
+        elif speech["source"] == "builtin":
+            speech["source"] = "third_party"
+    elif source_given:
+        validated["local_ai"]["voice_enabled"] = speech["source"] == "builtin"
+    for kind in validated["models"]:
+        source, profile = active_model(validated, kind)
+        if source == "builtin" or not profile.get("enabled"):
+            continue
+        if source == "third_party":
+            # Secure-store failures surface as their actionable MODEL_KEY_STORE_* errors;
+            # API_KEY_REQUIRED is reserved for a genuinely missing key.
+            key, _key_source = resolve_model_key(config, kind, source, profile["base_url"])
+            if not key:
+                raise AppError(
+                    "API_KEY_REQUIRED",
+                    "请先在模型与视频页为第三方服务保存 API Key，"
+                    f"或在本地 .env 配置 PUBLISHER_{kind.upper()}_API_KEY 并重启服务",
+                    409,
+                )
     validate_local_ai_settings(session, config, validated["local_ai"])
     if validated["publishing"]["auto_publish_after_approval"] and not session.scalar(select(Account.id)):
         raise AppError("PUBLISH_ACCOUNT_REQUIRED", "开启审核后自动发布前，请至少绑定一个平台账号", 409)
@@ -2246,6 +2653,12 @@ def schedules(session: DB):
 
 
 def validate_schedule_enabled(data: ScheduleInput, session: Session, config: AppConfig):
+    if data.enabled and data.kind == "collect":
+        enabled_kinds = set(session.scalars(select(Source.kind).where(Source.enabled.is_(True))))
+        if not (enabled_kinds - PAID_SOURCE_KINDS if not data.include_paid else enabled_kinds):
+            raise AppError("SOURCE_REQUIRED", "请先启用至少一个可自动采集的信息源", 409)
+        if data.include_paid and not tikhub_key_status(config)["key_configured"]:
+            raise AppError("TIKHUB_NOT_CONFIGURED", "包含 TikHub 付费来源前请先在设置中保存 TikHub API Key", 409)
     if data.enabled and data.kind == "pipeline":
         current = assert_models(session, config, ("text", "image", "speech"))
         if current["local_ai"]["avatar_enabled"]:

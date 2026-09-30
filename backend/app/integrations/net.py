@@ -37,27 +37,24 @@ def _proxy_for(scheme: str, hostname: str) -> str | None:
     return proxies.get(scheme) or proxies.get("all")
 
 
-def _resolve_addresses(hostname: str, port: int, proxy: str | None) -> set[str]:
-    if proxy is None:
-        return {item[4][0] for item in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)}
-    # When a configured outbound proxy is needed, local DNS can point at a wrong
-    # public address. Query a fixed HTTPS DNS service through that same proxy,
-    # validate the answers below, then still connect to a pinned public IP.
-    with _DNS_LOCK:
-        cached = _DNS_CACHE.get(hostname)
-        if cached and cached[0] > time.monotonic():
-            return cached[1]
+# Fixed DNS-over-HTTPS resolvers tried in order; one flaky provider must not fail every source.
+_DOH_RESOLVERS = (
+    ("dns.google", "https://dns.google/resolve", {}),
+    ("cloudflare-dns.com", "https://cloudflare-dns.com/dns-query", {"Accept": "application/dns-json"}),
+)
+
+
+def _doh_query(resolver: tuple[str, str, dict], hostname: str, proxy: str) -> tuple[set[str], int]:
+    host, endpoint, headers = resolver
     with (
         httpx.Client(
             proxy=proxy,
             trust_env=False,
-            verify=_PinnedTLSContext("dns.google"),
+            verify=_PinnedTLSContext(host),
             timeout=8,
             follow_redirects=False,
         ) as client,
-        client.stream(
-            "GET", "https://dns.google/resolve", params={"name": hostname, "type": "A"}
-        ) as response,
+        client.stream("GET", endpoint, params={"name": hostname, "type": "A"}, headers=headers) as response,
     ):
         if response.status_code != 200:
             raise IntegrationError("DNS_FAILED", "代理环境下的公网 DNS 查询失败")
@@ -77,6 +74,30 @@ def _resolve_addresses(hostname: str, port: int, proxy: str | None) -> set[str]:
             raise ValueError()
     except (ValueError, TypeError, KeyError):
         raise IntegrationError("DNS_FAILED", "公网 DNS 未返回有效地址") from None
+    return addresses, ttl
+
+
+def _resolve_addresses(hostname: str, port: int, proxy: str | None) -> set[str]:
+    if proxy is None:
+        return {item[4][0] for item in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)}
+    # When a configured outbound proxy is needed, local DNS can point at a wrong
+    # public address. Query fixed HTTPS DNS services through that same proxy,
+    # validate the answers below, then still connect to a pinned public IP.
+    with _DNS_LOCK:
+        cached = _DNS_CACHE.get(hostname)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+    last_error: Exception | None = None
+    for resolver in _DOH_RESOLVERS:
+        try:
+            addresses, ttl = _doh_query(resolver, hostname, proxy)
+            break
+        except (IntegrationError, httpx.HTTPError) as exc:
+            last_error = exc
+    else:
+        if isinstance(last_error, IntegrationError):
+            raise last_error
+        raise IntegrationError("DNS_FAILED", "代理环境下的公网 DNS 查询失败") from last_error
     with _DNS_LOCK:
         if len(_DNS_CACHE) >= 512:
             _DNS_CACHE.clear()
@@ -166,12 +187,49 @@ class _PinnedTLSContext(ssl.SSLContext):
         return super().wrap_socket(*args, server_hostname=self.requested_hostname, **kwargs)
 
 
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+_MAX_RETRY_DELAY = 10.0
+
+
+def _retry_delay(error: IntegrationError, attempt: int) -> float:
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is not None:
+        return min(_MAX_RETRY_DELAY, max(0.0, retry_after))
+    return min(_MAX_RETRY_DELAY, 1.5 * (2**attempt))
+
+
 def safe_get(
     url: str,
     *,
     max_bytes: int = 5_000_000,
     timeout: float = 20,
     stop_at_url: Callable[[str], bool] | None = None,
+    retries: int = 0,
+) -> tuple[bytes, str, str]:
+    """Fetch a public URL; transient 429/5xx/network failures are retried with bounded backoff."""
+
+    if not isinstance(retries, int) or not 0 <= retries <= 3:
+        raise IntegrationError("INVALID_LIMIT", "重试次数必须在 0 到 3 之间")
+    attempt = 0
+    while True:
+        try:
+            return _safe_get_once(url, max_bytes=max_bytes, timeout=timeout, stop_at_url=stop_at_url)
+        except IntegrationError as error:
+            transient = error.code in {"HTTP_TIMEOUT", "HTTP_FAILED", "DNS_FAILED"} or (
+                getattr(error, "status", None) in _RETRYABLE_STATUSES
+            )
+            if not transient or attempt >= retries:
+                raise
+            time.sleep(_retry_delay(error, attempt))
+            attempt += 1
+
+
+def _safe_get_once(
+    url: str,
+    *,
+    max_bytes: int,
+    timeout: float,
+    stop_at_url: Callable[[str], bool] | None,
 ) -> tuple[bytes, str, str]:
     """Fetch a public URL with redirect validation and a decoded-byte limit."""
 
@@ -238,7 +296,13 @@ def safe_get(
                                 redirected = True
                                 break
                             if response.status_code < 200 or response.status_code >= 300:
-                                raise IntegrationError("HTTP_ERROR", f"来源返回 HTTP {response.status_code}")
+                                error = IntegrationError("HTTP_ERROR", f"来源返回 HTTP {response.status_code}")
+                                error.status = response.status_code
+                                try:
+                                    error.retry_after = float(response.headers.get("retry-after", ""))
+                                except ValueError:
+                                    error.retry_after = None
+                                raise error
                             content_length = response.headers.get("content-length")
                             if content_length:
                                 try:

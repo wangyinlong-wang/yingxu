@@ -1,31 +1,56 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { api } from '../api';
-import { actionKey, formatDate, jobLabel, statusLabel } from '../lib';
+import { actionKey, formatDate, jobLabel, statusLabel, whitelistedStatus } from '../lib';
 import type { Job, JobTimelineItem } from '../types';
 import PageIntro from '../components/PageIntro.vue';
 import StatePanel from '../components/StatePanel.vue';
 import StatusTag from '../components/StatusTag.vue';
+const JOB_STATUSES = ['QUEUED','RUNNING','WAITING_USER','SUCCEEDED','FAILED','CANCELED'] as const;
+const route = useRoute();
 const jobs = ref<Job[]>([]), loading = ref(false), error = ref(''), status = ref(''), detail = ref<Job | null>(null), timer = ref<number>();
+const loadedOnce = ref(false), inFlight = ref(false), refreshError = ref(''), lastUpdated = ref('');
 const resolveDialog = ref(false), resolving = ref<Job | null>(null), resolution = ref<'not_completed' | 'cancel'>('not_completed'), confirmed = ref(false), notes = ref('');
 const isPublication = (job: Job) => job.kind.toLowerCase().includes('publication') || job.kind.toLowerCase().includes('publish');
-const requiresProviderResolution = (job: Job) => job.status !== 'RUNNING' && (!!job.requires_reconciliation || (job.status === 'WAITING_USER' && !isPublication(job)));
+const requiresProviderResolution = (job: Job) => job.status !== 'RUNNING' && !job.can_resume_video && (!!job.requires_reconciliation || (job.status === 'WAITING_USER' && !isPublication(job)));
 const displayTimeline = (job:Job):JobTimelineItem[] => job.timeline?.length ? job.timeline : job.steps.map(step => ({at:step.completed_at || step.started_at || job.updated_at,kind:'step',name:step.name,status:step.status,detail:step.detail}));
 const costLabel = (value:number|null|undefined) => value == null ? '未知' : `$${value}`;
-async function load() { loading.value = true; try {
-    jobs.value = (await api.jobs(status.value)).items;
+let loadSeq = 0;
+async function load(background = false) { if (background && inFlight.value)
+    return;
+    const seq = ++loadSeq;
+    inFlight.value = true;
+    if (!loadedOnce.value) { loading.value = true; if (!background) error.value = ''; }
+    try {
+    const items = (await api.jobs(status.value)).items;
+    if (seq !== loadSeq)
+        return;
+    jobs.value = items;
     if (detail.value) {
         const fresh = jobs.value.find(j => j.id === detail.value?.id);
         if (fresh)
             detail.value = fresh;
     }
+    error.value = '';
+    refreshError.value = '';
+    loadedOnce.value = true;
+    lastUpdated.value = new Date().toISOString();
 }
 catch (e: any) {
-    error.value = e.message;
+    if (seq !== loadSeq)
+        return;
+    if (loadedOnce.value || jobs.value.length)
+        refreshError.value = e.message || '自动刷新失败';
+    else
+        error.value = e.message;
 }
 finally {
-    loading.value = false;
+    if (seq === loadSeq) {
+        loading.value = false;
+        inFlight.value = false;
+    }
 } }
 async function open(id: string) { try {
     detail.value = await api.job(id);
@@ -52,32 +77,46 @@ async function resolve() { if (!resolving.value)
 catch (e: any) {
     ElMessage.error(e.message);
 } }
-onMounted(() => { load(); timer.value = window.setInterval(load, 5000); });
+onMounted(() => { status.value = whitelistedStatus(route.query.status, JOB_STATUSES); load(); timer.value = window.setInterval(() => load(true), 5000); });
+watch(() => route.query.status, value => { const next = whitelistedStatus(value, JOB_STATUSES); if (next !== status.value) { status.value = next; load(); } });
 onBeforeUnmount(() => timer.value && clearInterval(timer.value));
 </script>
 <template>
 <PageIntro title="任务中心" description="持续刷新队列状态。模型调用结果不明确时，不会直接重试或再次计费。">
-  <el-button @click="load">刷新</el-button>
+  <el-button :loading="inFlight && loadedOnce" @click="load()">刷新</el-button>
 </PageIntro>
-<el-select
-  v-model="status"
-  clearable
-  placeholder="全部状态"
-  @change="load"
->
-  <el-option
-    v-for="v in ['QUEUED','RUNNING','WAITING_USER','SUCCEEDED','FAILED','CANCELED']"
-    :key="v"
-    :label="statusLabel(v)"
-    :value="v"
-  />
-</el-select>
+<div class="jobs-toolbar">
+  <label class="filter-field">
+    <span>状态筛选</span>
+    <el-select
+      v-model="status"
+      clearable
+      placeholder="全部状态"
+      @change="load()"
+    >
+      <el-option
+        v-for="v in JOB_STATUSES"
+        :key="v"
+        :label="statusLabel(v)"
+        :value="v"
+      />
+    </el-select>
+  </label>
+</div>
+<el-alert
+  v-if="refreshError"
+  class="refresh-warning"
+  type="warning"
+  show-icon
+  :closable="false"
+  :title="`自动刷新失败，显示的是${lastUpdated ? ` ${formatDate(lastUpdated)} 更新` : '上一次成功加载'}的数据：${refreshError}`"
+/>
 <StatePanel
   :loading
   :error
-  :empty="!jobs.length"
+  :empty="loadedOnce && !jobs.length"
   empty-text="暂无任务"
-  @retry="load"
+  @retry="load()"
 >
   <el-table :data="jobs" class="data-table" @row-click="(row:Job)=>open(row.id)">
     <el-table-column label="任务" min-width="180">
@@ -126,12 +165,12 @@ onBeforeUnmount(() => timer.value && clearInterval(timer.value));
           取消
         </el-button>
         <el-button
-          v-if="['FAILED','CANCELED'].includes(row.status)"
+          v-if="(['FAILED','CANCELED'].includes(row.status) || (row.status==='WAITING_USER' && row.can_resume_video))"
           link
           type="primary"
           @click.stop="action('retry',row.id)"
         >
-          重试
+          {{ row.can_resume_video ? '继续查询原视频' : '重试' }}
         </el-button>
       </template>
     </el-table-column>

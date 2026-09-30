@@ -16,9 +16,10 @@ from sqlalchemy.orm import Session
 
 from .config import AppConfig
 from .db import settings
+from .model_credentials import resolve_model_key, resolve_tikhub_key
 from .models import Job, ModelCall, now, uid
 from .protocols import build_request, decode_response
-from .services import AppError, acquire_write, assert_models, digest, require, usage_summary
+from .services import AppError, acquire_write, active_model, assert_models, digest, require, usage_summary
 from .storage import register_file
 
 
@@ -86,18 +87,28 @@ def invoke_tikhub_source(
     job_id: str,
     owner: str,
     source_id: str,
-    screen_name: str,
+    screen_name: str | None = None,
+    search: tuple[str, str] | None = None,
 ) -> dict:
     """Perform one durable paid TikHub read; successful raw data is cached before parsing."""
 
-    endpoint = "https://api.tikhub.io/api/v1/twitter/web/fetch_user_post_tweet"
-    scope = f"job:{job_id}:source:{source_id}:twitter-user-posts"
+    if (screen_name is None) == (search is None):
+        raise AppError("INVALID_SOURCE", "TikHub 读取必须指定账号或搜索条件之一", 422)
+    if search is None:
+        endpoint = "https://api.tikhub.io/api/v1/twitter/web/fetch_user_post_tweet"
+        operation = "twitter-user-posts"
+        params = {"screen_name": screen_name}
+    else:
+        endpoint = "https://api.tikhub.io/api/v1/twitter/web/fetch_search_timeline"
+        operation = "twitter-search"
+        params = {"keyword": search[0], "search_type": search[1]}
+    scope = f"job:{job_id}:source:{source_id}:{operation}"
     request_key = digest(
         {
             "scope": scope,
             "method": "GET",
             "url": endpoint,
-            "params": {"screen_name": screen_name},
+            "params": params,
         }
     )
     slot = digest({"scope": scope, "kind": "source"})
@@ -132,7 +143,7 @@ def invoke_tikhub_source(
                 "该 TikHub 读取结果未明且已放弃重试，请新建明确的数据采集操作",
                 409,
             )
-        credential = config.tikhub_api_key.get_secret_value()
+        credential, _credential_source = resolve_tikhub_key(config)
         if not credential:
             raise AppError("TIKHUB_NOT_CONFIGURED", "请先在本机配置 TikHub API Key", 409)
         current = settings(session, config)
@@ -151,7 +162,7 @@ def invoke_tikhub_source(
                 job_id=job_id,
                 request_key=request_key,
                 kind="source",
-                model="tikhub:twitter-user-posts",
+                model=f"tikhub:{operation}",
                 status="STARTED",
                 events=[event],
             )
@@ -183,7 +194,7 @@ def invoke_tikhub_source(
             with client.stream(
                 "GET",
                 endpoint,
-                params={"screen_name": screen_name},
+                params=params,
                 headers={"Authorization": f"Bearer {credential}", "Accept": "application/json"},
             ) as response:
                 status = response.status_code
@@ -358,7 +369,11 @@ def invoke_model(
         acquire_write(session)
         job = _lease_guard(session, job_id, owner)
         current = assert_models(session, config, (kind,))
-        provider = current["models"][kind]
+        source, provider = active_model(current, kind)
+        if provider is None:
+            raise AppError(
+                "MODEL_NOT_CONFIGURED", "内置本地声音引擎不通过模型 HTTP 接口调用", 409
+            )
         endpoint, request, accept = build_request(kind, provider, payload)
         url = provider["base_url"].rstrip("/") + "/" + endpoint
         output_processing = (
@@ -375,6 +390,9 @@ def invoke_model(
                 "url": url,
                 "request": request,
                 "output_processing": output_processing,
+                # Only local profiles carry a discriminator, so legacy third-party
+                # in-flight and cached request keys stay byte-identical.
+                **({"source": "local"} if source == "local" else {}),
             }
         )
         slot = digest({"scope": scope, "kind": kind})
@@ -411,6 +429,9 @@ def invoke_model(
             raise AppError(
                 "DAILY_CALL_LIMIT", "已达到今日模型调用上限，任务已保留，可调整额度或次日重试", 409
             )
+        # Resolve the credential before recording dispatch/STARTED so a Keychain failure
+        # can never leave a false unknown paid call behind. Local keys are optional.
+        credential, _key_source = resolve_model_key(config, kind, source, provider["base_url"])
         attempt_id = uid()
         event = {"started_at": now(), "status": "STARTED", "job_id": job_id, "attempt_id": attempt_id}
         if existing:
@@ -457,11 +478,14 @@ def invoke_model(
                 events[-1]["dispatch_at"] = now()
                 record.events = events
                 session.commit()
+            headers = {"Accept": accept}
+            if credential:
+                headers["Authorization"] = f"Bearer {credential}"
             with client.stream(
                 "POST",
                 url,
                 json=request,
-                headers={"Authorization": f"Bearer {config.key(kind)}", "Accept": accept},
+                headers=headers,
             ) as response:
                 status = response.status_code
                 if status >= 300:

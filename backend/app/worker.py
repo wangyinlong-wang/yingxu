@@ -103,6 +103,10 @@ def recover_expired(session: Session, queue: str, instant: datetime) -> int:
             job.status, job.current_step = "CANCELED", "已停止（中断恢复）"
             _release_canceled_publication(session, job)
             _reset_content(session, job)
+        elif calls and all(call.kind == "video" and call.response.get("task_id") for call in calls):
+            # A durable video task ID makes recovery a read-only poll, never another paid create.
+            job.status, job.error_code, job.error_message = "QUEUED", None, None
+            job.current_step = "继续查询已提交的视频任务"
         elif calls:
             job.status, job.error_code = "WAITING_USER", "MODEL_OUTCOME_UNKNOWN"
             job.error_message = "执行进程曾中断，模型调用结果需要核验；系统不会自动重发"
@@ -135,6 +139,40 @@ def scheduled_instant(day, wall_time: str, zone: ZoneInfo) -> datetime:
     return local.astimezone(UTC)
 
 
+_UNFINISHED_JOB_STATUSES = ("QUEUED", "RUNNING", "WAITING_USER")
+
+
+def _tick_collect(session, schedule: Schedule, instant: datetime) -> int:
+    """Interval collection: runs on enable, then every interval; missed runs coalesce into one."""
+    interval = timedelta(minutes=schedule.interval_minutes or 180)
+    enabled_at = datetime.fromisoformat(schedule.enabled_at or schedule.created_at)
+    due = datetime.fromisoformat(schedule.last_run_at) + interval if schedule.last_run_at else enabled_at
+    if schedule.last_run_at and datetime.fromisoformat(schedule.last_run_at) < enabled_at:
+        due = enabled_at
+    if instant < due:
+        if schedule.next_run_at != due.isoformat():
+            schedule.next_run_at = due.isoformat()
+        return 0
+    unfinished = session.scalars(
+        select(Job).where(Job.kind == "COLLECT_BATCH", Job.status.in_(_UNFINISHED_JOB_STATUSES))
+    )
+    if any(job.payload.get("schedule_id") == schedule.id for job in unfinished):
+        schedule.next_run_at = (instant + timedelta(minutes=1)).isoformat()
+        return 0
+    slot = instant.replace(second=0, microsecond=0).isoformat()
+    enqueue(
+        session,
+        kind="COLLECT_BATCH",
+        payload={"schedule_id": schedule.id, "scheduled_at": slot, "include_paid": bool(schedule.include_paid)},
+        key=f"schedule:{schedule.id}:{slot}:collect",
+    )
+    zone = ZoneInfo(schedule.timezone)
+    schedule.last_scheduled_date = instant.astimezone(zone).date().isoformat()
+    schedule.last_run_at = instant.isoformat()
+    schedule.next_run_at = (instant + interval).isoformat()
+    return 1
+
+
 def tick_schedules(engine, instant: datetime | None = None) -> int:
     instant = instant or datetime.now(UTC)
     triggered = 0
@@ -142,6 +180,9 @@ def tick_schedules(engine, instant: datetime | None = None) -> int:
         acquire_write(session)
         schedules = list(session.scalars(select(Schedule).where(Schedule.enabled.is_(True))))
         for schedule in schedules:
+            if schedule.kind == "collect":
+                triggered += _tick_collect(session, schedule, instant)
+                continue
             zone = ZoneInfo(schedule.timezone)
             local_date = instant.astimezone(zone).date()
             today = scheduled_instant(local_date, schedule.time, zone)
